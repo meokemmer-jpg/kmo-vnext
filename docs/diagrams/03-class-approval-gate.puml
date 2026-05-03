@@ -1,0 +1,132 @@
+@startuml 03-class-approval-gate
+' KMO A4 ApprovalGate + AuditLog -- UML Class-Diagram [CRUX-MK]
+' Audience: Board + CTO. Zeigt HMAC-Token + Dual-Control + Hash-Chain.
+
+skinparam classAttributeIconSize 0
+skinparam class {
+    BackgroundColor #E3F2FD
+    BorderColor #1565C0
+    ArrowColor #1565C0
+}
+
+title A4 -- ApprovalGate + AuditLog (HMAC + Dual-Control + Hash-Chain)
+
+class ApprovalToken <<dataclass(frozen)>> {
+    + requester : str
+    + resource : str
+    + action : str
+    + issued_at : int
+    + expires_at : int
+    + nonce : str
+    + signature : str
+    --
+    + serialize() : str
+    + {static} deserialize(token_str: str) : ApprovalToken
+    --
+    - _compute_hmac(secret: str) : str
+}
+
+class DualApprovalToken <<dataclass(frozen)>> {
+    + primary : ApprovalToken
+    + secondary : ApprovalToken
+    + requester : str
+    --
+    + serialize() : str
+    + {static} deserialize(dual_str: str) : DualApprovalToken
+    + assert_three_way_disjoint() : None
+}
+
+class ApprovalGate {
+    + {static} TOKEN_TTL_SECONDS : int = 86400
+    + {static} ENV_SECRET_KEY : str = "KMO_APPROVAL_SECRET"
+    --
+    - _db_path : Path
+    - _config_path : Path
+    - _secret : bytes
+    - _authorized_identities : set[str]
+    --
+    + __init__(db_path: Path, config_path: Path, secret: Optional[str])
+    + request_approval(resource: str, action: str, requester: str) : str
+    + verify_token(token_str: str, resource: str, action: str) : bool
+    + revoke_token(token_str: str) : None
+    + acquire_deploy_lock(resource: str, holder: str, ttl_seconds: int) : bool
+    + release_deploy_lock(resource: str, holder: str) : bool
+    + request_dual_approval(resource: str, action: str, requester: str, primary_signer: str, secondary_signer: str) : DualApprovalToken
+    + verify_dual_token(dual_token: DualApprovalToken, resource: str, action: str) : bool
+    + pre_deploy_atomic(dual_token: DualApprovalToken, resource: str, action: str, holder: str) : bool
+    --
+    - _consume_token_in_tx(conn: sqlite3.Connection, nonce: str) : bool
+    - _check_identity(identity: str) : None
+    - _load_secret() : bytes
+}
+
+class AuditEntry <<dataclass(frozen)>> {
+    + block_index : int
+    + timestamp : int
+    + action : str
+    + resource : str
+    + requester : str
+    + approver_token_nonce : str
+    + prev_hash : str
+    + block_hash : str
+    --
+    + to_json_line() : str
+    + compute_block_hash() : str
+}
+
+class AuditLog {
+    - _log_path : Path
+    - _last_hash : str
+    --
+    + __init__(log_path: Path)
+    + append(action: str, resource: str, requester: str, approver_token_nonce: str) : AuditEntry
+    + append_within_transaction(conn: sqlite3.Connection, action: str, resource: str, requester: str, approver_token_nonce: str) : AuditEntry
+    + flush_entry_to_jsonl(entry: AuditEntry) : None
+    + verify_chain() : bool
+    --
+    - _load_last_hash() : str
+    - _compute_chain_hash(prev: str, entry_data: dict) : str
+}
+
+database "approval_gate.db" as DB {
+    + tokens
+    + dual_tokens
+    + deploy_locks
+    + audit_chain
+}
+
+note top of ApprovalGate::pre_deploy_atomic
+    BEGIN IMMEDIATE
+    + verify dual
+    + consume primary
+    + consume secondary
+    + acquire deploy_lock
+    + audit append (TX)
+    COMMIT (or ROLLBACK)
+    --
+    100% atomic, no partial state
+end note
+
+note right of DualApprovalToken
+    3-way disjoint identities:
+    - requester (initiator)
+    - primary_signer
+    - secondary_signer
+    PermissionError if not.
+end note
+
+note bottom of AuditLog
+    Hash-Chain (SHA256):
+    H(n) = SHA256(H(n-1) ++ entry)
+    Tamper-evident: ANY change
+    invalidates ALL subsequent.
+end note
+
+ApprovalGate *-- ApprovalToken : issues
+ApprovalGate *-- DualApprovalToken : issues
+ApprovalGate ..> AuditLog : append_via_TX
+ApprovalGate ..> DB : SQL_ops
+DualApprovalToken o-- ApprovalToken : has 2x
+AuditLog *-- AuditEntry : produces
+
+@enduml

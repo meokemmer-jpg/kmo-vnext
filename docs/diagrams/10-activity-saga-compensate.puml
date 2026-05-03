@@ -1,0 +1,124 @@
+@startuml 10-activity-saga-compensate
+' KMO Saga-Compensate-Chain -- Activity-Diagram [CRUX-MK]
+' Audience: Board + CTO. Forward + Reverse-Chain mit Decision-Punkten.
+
+skinparam activity {
+    BackgroundColor<<Forward>> #C8E6C9
+    BorderColor<<Forward>> #2E7D32
+    BackgroundColor<<Decision>> #FFCCBC
+    BorderColor<<Decision>> #BF360C
+    BackgroundColor<<Reverse>> #FFE0B2
+    BorderColor<<Reverse>> #E65100
+    BackgroundColor<<Persist>> #BBDEFB
+    BorderColor<<Persist>> #0D47A1
+}
+
+title A2 -- Saga 7-Phase Forward + Reverse-Chain Compensation
+
+start
+
+:execute(saga_run_id, initial_input);
+:_atomic_write_state(SagaRun);
+
+partition "Forward-Chain (do)" {
+    repeat
+        :phase = phases[current_idx];
+        :phase.status = RUNNING <<Forward>>;
+        :_atomic_write_state();
+
+        partition "do_func" {
+            :input = previous output or initial_input;
+            :try output = do_func(input, ctx);
+
+            if (Exception raised?) then (yes)
+                :phase.status = FAILED;
+                :_atomic_write_state();
+                stop_forward
+            else (no)
+                :phase.output = output;
+            endif
+        }
+
+        partition "exit_criteria check" {
+            if (exit_criteria_func defined?) then (yes)
+                :result = exit_criteria_func(output);
+                if (result == True?) then (yes)
+                    :phase.status = DONE <<Forward>>;
+                else (no)
+                    :phase.status = FAILED <<Decision>>;
+                    :error = "exit_criteria failed";
+                    :_atomic_write_state();
+                    stop_forward
+                endif
+            else (no)
+                :phase.status = DONE <<Forward>>;
+            endif
+        }
+
+        :_atomic_write_state() <<Persist>>;
+        :current_phase_idx++;
+
+    repeat while (current_idx < len(phases)?) is (yes)
+
+    :all phases DONE;
+    :overall_status = DONE;
+    :_atomic_write_state();
+    :return SagaResult(DONE, phases_done=N);
+    stop
+}
+
+label stop_forward
+:overall_status = COMPENSATING;
+:_atomic_write_state() <<Persist>>;
+
+partition "Reverse-Chain (undo)" {
+    :reversed_idx = current_idx;
+    :phases_undone = 0;
+    :failed_undo_count = 0;
+
+    repeat
+        :phase = phases[reversed_idx];
+
+        if (phase.status == DONE?) then (yes)
+            :phase.status = UNDOING <<Reverse>>;
+            :_atomic_write_state();
+
+            partition "undo_func" {
+                :try undo_func(phase.input, phase.output, ctx);
+                if (Exception raised?) then (yes)
+                    :phase.status = UNDO_FAILED;
+                    :failed_undo_count++;
+                else (no)
+                    :phase.status = UNDONE <<Reverse>>;
+                    :phases_undone++;
+                endif
+            }
+
+            :_atomic_write_state();
+        else (no)
+            :SKIP - was never DONE;
+            :phase.status = SKIPPED;
+        endif
+
+        :reversed_idx--;
+
+    repeat while (reversed_idx >= 0?) is (yes)
+
+    if (failed_undo_count == 0?) then (yes)
+        :overall_status = COMPENSATED <<Reverse>>;
+    else (no)
+        :overall_status = PARTIAL_COMPENSATION <<Decision>>;
+        note right
+            One or more undo_func raised.
+            Manual intervention required.
+            Audit trail in state-file.
+        end note
+    endif
+
+    :_atomic_write_state() <<Persist>>;
+    :return SagaResult(status=overall_status,\nphases_done=N,\nphases_undone=M);
+}
+
+stop
+
+@enduml

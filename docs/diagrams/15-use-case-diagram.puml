@@ -1,0 +1,138 @@
+@startuml 15-use-case-diagram
+' KMO Use-Case-Diagram -- Aktor-Rollen und Use-Cases [CRUX-MK]
+' Audience: Board + CTO. Wer macht was im KMO?
+
+left to right direction
+skinparam usecase {
+    BackgroundColor #FFFDE7
+    BorderColor #F57F17
+}
+skinparam actor {
+    BackgroundColor #E1F5FE
+    BorderColor #0277BD
+}
+
+title KMO Use-Cases (Aktor-Perspektive)
+
+actor "Architekt\n(Claude Opus)" as ARCH
+actor "Operator\n(Martin)" as OP
+actor "CTO\n(Gerdi)" as CTO
+actor "DF-Executor\n(DF-86 etc.)" as DF
+actor "Reviewer\n(Board/Imke)" as REV
+actor "Subagent" as SUB
+
+rectangle "KMO-Pipeline (DEV-Stage)" {
+
+    package "Pre-Routing" {
+        usecase "UC1\nPre-Routing-Check\nausfuehren" as UC1
+        usecase "UC2\nSECRET-Pattern\ndetektieren" as UC2
+        usecase "UC3\nProvider-Compat\npruefen" as UC3
+    }
+
+    package "Resource-Locking" {
+        usecase "UC4\nLease akquirieren" as UC4
+        usecase "UC5\nLease releasen" as UC5
+        usecase "UC6\nStale-Lease\nbereinigen" as UC6
+        usecase "UC7\nSTOP.flag setzen\n(Notbremse)" as UC7
+    }
+
+    package "Approval-Flow" {
+        usecase "UC8\nDeploy-Token\nanfordern" as UC8
+        usecase "UC9\nDual-Sign\nausfuehren\n(2-of-2)" as UC9
+        usecase "UC10\nAtomic-Pre-Deploy" as UC10
+        usecase "UC11\nAudit-Chain\nverifizieren" as UC11
+    }
+
+    package "Workflow-Lifecycle" {
+        usecase "UC12\nWorkflow starten" as UC12
+        usecase "UC13\nPhase-Transition\ntriggern" as UC13
+        usecase "UC14\nCrash-Recovery" as UC14
+        usecase "UC15\nSnapshot erzeugen" as UC15
+    }
+
+    package "Saga 7-Phasen" {
+        usecase "UC16\nSaga ausfuehren" as UC16
+        usecase "UC17\nCompensate-Chain\ntriggern" as UC17
+        usecase "UC18\nResume nach Crash" as UC18
+    }
+
+    package "Outbox Cross-Machine" {
+        usecase "UC19\nEvent publizieren" as UC19
+        usecase "UC20\nEvent konsumieren" as UC20
+        usecase "UC21\nDLQ inspizieren" as UC21
+    }
+
+    package "Audit/Demo" {
+        usecase "UC22\nAudit-Trail\nlesen" as UC22
+        usecase "UC23\nDemo-URL\nverteilen" as UC23
+        usecase "UC24\nRollback\nausfuehren" as UC24
+    }
+}
+
+' Architekt - System-Aufbau
+ARCH --> UC12 : starts pipeline
+ARCH --> UC16 : runs Saga
+ARCH --> UC4 : acquires lease
+ARCH --> UC19 : publishes events
+ARCH --> UC1 : routes prompts
+
+' Operator (Martin) - Operative Steuerung
+OP --> UC8 : requests approval
+OP --> UC9 : signs as primary
+OP --> UC7 : raises STOP.flag
+OP --> UC22 : reads audit
+OP --> UC24 : decides rollback
+
+' CTO (Gerdi) - Sign-Off-Rolle
+CTO --> UC9 : signs as secondary
+CTO --> UC22 : reads audit
+CTO --> UC11 : verifies chain
+CTO --> UC23 : opens demo URL
+
+' DF-Executor - Datenklient
+DF --> UC4 : acquires DF-lease
+DF --> UC5 : releases on done
+DF --> UC20 : subscribes events
+DF --> UC13 : reports phase-status
+
+' Reviewer (Board/Imke) - External
+REV --> UC23 : reviews demo
+REV --> UC22 : reads audit-trail (RO)
+
+' Subagent - Internal (per Saga-Phase)
+SUB --> UC16 : runs phases (do/undo)
+SUB --> UC17 : compensates on fail
+
+' Use-Case Includes/Extends
+UC1 ..> UC2 : <<includes>>
+UC1 ..> UC3 : <<includes>>
+UC10 ..> UC9 : <<includes>>
+UC10 ..> UC11 : <<includes>>
+UC10 ..> UC4 : <<includes>>
+UC16 ..> UC17 : <<extends, on phase-fail>>
+UC14 ..> UC18 : <<extends, on resume>>
+UC4 ..> UC6 : <<extends, on conflict>>
+UC4 ..> UC7 : <<extends, blocks if active>>
+
+note right of OP
+    Operator holds:
+    - KMO_APPROVAL_SECRET
+    - STOP.flag write-rights
+    - Demo-Auth credentials
+end note
+
+note bottom of CTO
+    CTO holds:
+    - Secondary signing key
+    - Audit-verify rights
+    - Demo-URL access
+end note
+
+note bottom of REV
+    Reviewer is READ-ONLY:
+    - No deploy permissions
+    - No state mutation
+    - Just observation
+end note
+
+@enduml

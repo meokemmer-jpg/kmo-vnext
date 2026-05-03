@@ -1,0 +1,129 @@
+@startuml 05-class-saga-engine
+' KMO A2 SagaEngine -- UML Class-Diagram [CRUX-MK]
+' Audience: Board + CTO. do/undo + reverse-chain + exit-criteria.
+
+skinparam classAttributeIconSize 0
+skinparam class {
+    BackgroundColor #FFF8E1
+    BorderColor #EF6C00
+    ArrowColor #EF6C00
+}
+
+title A2 -- SagaEngine (do/undo + Reverse-Chain Compensation)
+
+enum PhaseStatus <<str, Enum>> {
+    + PENDING
+    + RUNNING
+    + DONE
+    + FAILED
+    + UNDOING
+    + UNDONE
+    + UNDO_FAILED
+    + SKIPPED
+}
+
+enum SagaStatus <<str, Enum>> {
+    + PENDING
+    + RUNNING
+    + DONE
+    + FAILED
+    + COMPENSATING
+    + COMPENSATED
+    + PARTIAL_COMPENSATION
+}
+
+class SagaPhase <<dataclass>> {
+    + phase_id : str
+    + name : str
+    + status : PhaseStatus = PENDING
+    + input : Any = None
+    + output : Any = None
+    + error : Optional[str] = None
+    + started_at : Optional[float] = None
+    + finished_at : Optional[float] = None
+    --
+    + to_dict() : dict
+    + {static} from_dict(d: dict) : SagaPhase
+}
+
+class SagaRun <<dataclass>> {
+    + run_id : str
+    + phases : list[SagaPhase]
+    + current_phase_idx : int = 0
+    + overall_status : SagaStatus = PENDING
+    + initial_input : Any = None
+    + error : Optional[str] = None
+    + created_at : float
+    + updated_at : float
+    --
+    + to_dict() : dict
+    + {static} from_dict(d: dict) : SagaRun
+}
+
+class SagaResult <<dataclass>> {
+    + run_id : str
+    + status : SagaStatus
+    + final_output : Any = None
+    + error : Optional[str] = None
+    + phases_done : int = 0
+    + phases_undone : int = 0
+}
+
+class SagaEngine {
+    - _state_dir : Path
+    - _phases : list[dict]
+    - _do_funcs : dict[str, Callable]
+    - _undo_funcs : dict[str, Callable]
+    - _exit_criteria : dict[str, Callable]
+    --
+    + __init__(state_dir: Path | str)
+    + register_phase(phase_id: str, name: str, do_func: Callable[[Any, dict], Any], undo_func: Callable[[Any, Any, dict], None], exit_criteria_func: Optional[Callable[[Any], bool]]) : None
+    + execute(saga_run_id: str, initial_input: Any) : SagaResult
+    + resume(saga_run_id: str) : SagaResult
+    + get_status(run_id: str) : Optional[dict]
+    --
+    - _atomic_write_state(run: SagaRun) : None
+    - _read_state(run_id: str) : Optional[SagaRun]
+    - _run_forward(run: SagaRun) : SagaResult
+    - _compensate(run: SagaRun) : SagaResult
+    - _check_exit_criteria(phase_id: str, output: Any) : bool
+}
+
+class PhaseRegistry <<module>> {
+    + register_kmo_phases(engine: SagaEngine) : None
+    --
+    KMO-7-Phasen:
+    1. Plan
+    2. Spec
+    3. Wargame (gate: verdict>=CONDITIONAL)
+    4. Build
+    5. Test (gate: tests_passed)
+    6. DEV-Demo
+    7. Approval/Gerdi (gate: approved)
+}
+
+note right of SagaEngine::_compensate
+    Reverse-Chain-Regel:
+    - Iteriere phases REVERSED
+    - Nur Status==DONE undo'd
+    - RUNNING/FAILED skip
+    - Idempotent undo expected
+    - UNDO_FAILED -> PARTIAL_COMPENSATION
+end note
+
+note bottom of SagaEngine::execute
+    Atomic-State-Write nach
+    JEDEM Phase-Wechsel:
+    tempfile + flush + fsync
+    + os.replace
+    Crash mid-write impossible.
+end note
+
+SagaEngine *-- SagaRun : runs
+SagaEngine ..> SagaResult : returns
+SagaEngine *-- PhaseRegistry : populates
+SagaRun *-- SagaPhase : has 7
+SagaPhase *-- PhaseStatus : has
+SagaRun *-- SagaStatus : has
+
+@enduml

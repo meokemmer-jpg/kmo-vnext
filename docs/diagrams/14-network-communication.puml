@@ -1,0 +1,120 @@
+@startuml 14-network-communication
+' KMO Network/Communication-Diagram -- Wer ruft wen [CRUX-MK]
+' Audience: Board + CTO. HTTP/SQLite/Filesystem/Subprocess Channels.
+
+skinparam component {
+    BackgroundColor #FFFFFF
+    BorderColor #424242
+}
+
+title KMO Network/Communication-Channels (Production-Reife: 6 Patches)
+
+actor "Operator/Martin" as MARTIN
+actor "CTO/Gerdi" as GERDI
+actor "Board-Reviewer" as BOARD
+
+cloud "Internet" as INET
+
+node "Cloudflare Edge" as CF_EDGE {
+    [Cloudflare-Tunnel] as CF
+}
+
+node "Mac-Host" as MAC {
+    package "Docker-Network: kmo-net" as DN {
+        [kmo-gateway:8080] as GW
+        [data-class-filter] as DCF
+        [lease-manager] as LM
+        [approval-gate] as AG
+        [saga-engine] as SE
+        [outbox-pattern] as OB
+    }
+
+    folder "Host-Filesystem" as FS {
+        database "leases.db (WAL)" as LDB
+        database "approval_gate.db" as ADB
+        database "outbox-state.db" as ODB
+        file "events.jsonl" as EJL
+        file "kmo-routing-decisions.jsonl" as RJL
+        file "kmo-approval-chain.jsonl" as AJL
+        folder "outbox/" as OUT
+        folder "outbox-ack/" as ACK
+        folder "outbox-dlq/" as DLQ
+    }
+
+    [DF-86 Engine] as DF86
+    [DF-87 Engine] as DF87
+}
+
+cloud "Drive-Sync (Google)" as DRIVE {
+    [Mac-Outbox-Mirror] as MAC_OUT
+    [Win-Outbox-Mirror] as WIN_OUT
+}
+
+node "Windows-Host" as WIN {
+    [Windows-Consumer\n(DF-Worker)] as WINCONS
+    database "win-consumer.db" as WCDB
+}
+
+' Inbound HTTPS/HTTP
+BOARD --> INET : HTTPS
+GERDI --> INET : HTTPS
+MARTIN --> INET : HTTPS
+INET --> CF_EDGE : HTTPS\n(*.trycloudflare.com)
+CF --> GW : tunnel-protocol\nINTERNAL_HTTP :8080
+
+' Gateway -> Filesystem (RO mounts)
+GW --> AJL : RO read for /audit
+GW --> RJL : RO read for /audit
+GW --> EJL : RO read for /workflows
+note right of GW
+    Gateway is READ-ONLY
+    on host filesystem.
+    Demo dashboard only.
+end note
+
+' Module-internal: SQLite-File access (Same-Host)
+DCF --> RJL : append (JSONL)
+LM --> LDB : SQLite via WAL
+AG --> ADB : SQLite (BEGIN IMMEDIATE)
+AG --> AJL : append (JSONL)
+SE --> EJL : append + fsync
+SE --> "FS state_dir" as SES : atomic_write
+OB --> ODB : counter SQLite
+OB --> OUT : atomic_write_json
+OB --> ACK : write ack-files
+
+' Drive-Sync replication (Filesystem-via-OS)
+OUT <-> MAC_OUT : Drive-Sync OS-level
+MAC_OUT <==> WIN_OUT : Google-Drive cloud
+WIN_OUT --> WINCONS : Drive-Sync OS-level
+WINCONS --> WCDB : processed_events SQLite
+WINCONS --> WIN_OUT : write ack-files
+
+' DF-Engine-side
+DF86 ..> LM : acquire(DF, "df-86")
+DF86 ..> OB : subscribe(["nlm-source"])
+DF86 ..> SE : Saga-Phase-Callback
+DF87 ..> LM : acquire(DF, "df-87")
+DF87 ..> OB : subscribe(["wargame-source"])
+
+' Subprocess (Container-Spawn)
+note as Sub
+    Docker-Compose orchestriert:
+    docker run -d <service> = subprocess.Popen
+    Each service = own container
+    Healthcheck via stdin (python -c)
+end note
+
+note as Channels
+    Communication-Channel-Types:
+    1. HTTPS (CF -> Mac)
+    2. HTTP-internal :8080 (kmo-net bridge)
+    3. SQLite-WAL (same-host file lock)
+    4. JSONL append + fsync
+    5. tempfile + os.replace (atomic-write)
+    6. mkdir-mutex (FS-coordination)
+    7. Drive-Sync OS-replication (Mac<->Win)
+    8. Subprocess (Container spawn)
+end note
+
+@enduml

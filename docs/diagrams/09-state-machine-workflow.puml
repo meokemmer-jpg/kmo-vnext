@@ -1,0 +1,102 @@
+@startuml 09-state-machine-workflow
+' KMO DurableStateMachine -- State-Machine-Diagram [CRUX-MK]
+' Audience: Board + CTO. Alle WorkflowStatus-Transitions mit Trigger-Conditions.
+
+skinparam state {
+    BackgroundColor<<Active>> #C8E6C9
+    BorderColor<<Active>> #2E7D32
+    BackgroundColor<<Blocked>> #FFCCBC
+    BorderColor<<Blocked>> #BF360C
+    BackgroundColor<<Final>> #BBDEFB
+    BorderColor<<Final>> #0D47A1
+}
+
+title A7 -- WorkflowStatus State-Machine (Event-Sourced)
+
+[*] --> PENDING : start_workflow()\nWORKFLOW_STARTED event\nseq=1
+
+state PENDING <<Active>> {
+    PENDING : current_phase = "init"
+    PENDING : sequence = 1
+    PENDING : state_data = initial_state
+}
+
+PENDING --> RUNNING : transition()\nfirst STATE_TRANSITION
+
+state RUNNING <<Active>> {
+    RUNNING : current_phase advances
+    RUNNING : sequence ++ on each event
+    RUNNING : state_data merged via state_patch
+    RUNNING --> RUNNING : transition_phase(from -> to)\nappend STATE_TRANSITION
+    RUNNING --> RUNNING : transition(EventType.X)\nappend domain event
+    RUNNING --> RUNNING : snapshot()\nevery 10 events\nappend SNAPSHOT_TAKEN
+}
+
+RUNNING --> PAUSED : explicit pause\n(operator)
+
+state PAUSED <<Blocked>> {
+    PAUSED : Workflow can be resumed
+    PAUSED : No timeout (persists indefinitely)
+}
+
+PAUSED --> RUNNING : resume signal\n(transition() called again)
+
+RUNNING --> DONE : final phase reached\nstatus update via\n_apply_event()
+
+RUNNING --> FAILED : exception during transition\nor exit_criteria fails
+
+RUNNING --> ABORTED : explicit abort\n(operator decision)
+
+state DONE <<Final>> {
+    DONE : Terminal success
+    DONE : All events persisted
+}
+
+state FAILED <<Final>> {
+    FAILED : Terminal failure
+    FAILED : SagaEngine triggers compensate
+    FAILED : Lease released in finally{}
+}
+
+state ABORTED <<Final>> {
+    ABORTED : Terminal abort
+    ABORTED : No compensation triggered
+}
+
+DONE --> [*]
+FAILED --> [*]
+ABORTED --> [*]
+
+' Crash-Recovery branch
+state "Process Crash" as CRASH {
+    CRASH : Process dies mid-execution
+    CRASH : events.jsonl persisted up to last fsync
+    CRASH : state.lock/ may be stale
+}
+
+note left of CRASH
+    Crash kann an JEDEM Punkt
+    in RUNNING auftreten.
+end note
+
+CRASH --> "RECOVERY" : new process\nDurableStateMachine.recover()
+
+state "RECOVERY" as REC {
+    REC : 1. Read latest snapshot
+    REC : 2. Read events.jsonl
+    REC : 3. Filter seq > snapshot.seq
+    REC : 4. Replay via _apply_event()
+    REC : 5. Stale lock claim if mtime>300s
+}
+
+REC --> RUNNING : full state recovered\ncan continue transitions
+
+note right of RUNNING
+    Atomic-Mutex per Workflow:
+    state.lock/ via mkdir(exist_ok=False)
+    Stale-TTL: 300s
+    -> ConcurrentTransitionError
+       wenn aktiv von anderem Prozess
+end note
+
+@enduml

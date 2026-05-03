@@ -1,0 +1,113 @@
+@startuml 16-layered-architecture
+' KMO Layered-Architecture (5-Layer-Stack) [CRUX-MK]
+' Audience: Board + CTO. Bottom-Up Phys -> Storage -> Governance -> Saga -> Gateway.
+
+skinparam component {
+    BackgroundColor #FFFFFF
+    BorderColor #424242
+}
+skinparam package {
+    BackgroundColor<<L1>> #E8EAF6
+    BorderColor<<L1>> #283593
+    BackgroundColor<<L2>> #F3E5F5
+    BorderColor<<L2>> #6A1B9A
+    BackgroundColor<<L3>> #FFEBEE
+    BorderColor<<L3>> #C62828
+    BackgroundColor<<L4>> #FFF8E1
+    BorderColor<<L4>> #EF6C00
+    BackgroundColor<<L5>> #C8E6C9
+    BorderColor<<L5>> #2E7D32
+}
+
+title KMO 5-Layer-Architecture (Bottom-Up)
+
+package "L5: Gateway-API + DEV-Stage (UI/Demo)" <<L5>> as L5 {
+    [FastAPI-Gateway :8080] as GW
+    [Cloudflare-Tunnel] as CF
+    [Docker-Compose Stack] as DCOMP
+    note bottom: Public-URL-Demo + Healthchecks
+}
+
+package "L4: Saga-Orchestration + Workflow-Lifecycle" <<L4>> as L4 {
+    [SagaEngine] as SE
+    [DurableStateMachine] as DSM
+    [phase_registry (KMO-7-Phasen)] as PREG
+    note bottom: 7-Phasen do/undo + Crash-Recovery
+}
+
+package "L3: Governance-Modules (Cross-Cutting)" <<L3>> as L3 {
+    [DataClassFilter] as DCF
+    [LeaseManager] as LM
+    [ApprovalGate] as AG
+    [AuditLog] as AL
+    [OutboxProducer/Consumer] as OB
+    note bottom: 6 Patches, je 200-500 LoC, 100% Test-Coverage
+}
+
+package "L2: Storage (Persistence)" <<L2>> as L2 {
+    database "SQLite-WAL" as SQL {
+        [leases.db]
+        [approval_gate.db]
+        [outbox-state.db]
+    }
+    folder "JSONL Append-Only" as JSONL {
+        [events.jsonl]
+        [routing-decisions.jsonl]
+        [approval-chain.jsonl]
+    }
+    folder "Atomic-FS Files" as FS {
+        [snapshots/<seq>.json]
+        [<run_id>.json (Saga-State)]
+        [outbox/<topic>-<seq>.json]
+    }
+    folder "FS-Mutexes" as MUT {
+        [state.lock/ (mkdir)]
+    }
+}
+
+package "L1: Physical-Layer (OS + Stdlib)" <<L1>> as L1 {
+    [Python 3.14 Runtime] as PY
+    [POSIX File-System] as POSIX
+    [stdlib: hmac, hashlib, secrets] as CRYPTO
+    [stdlib: tempfile, os.replace, fsync] as ATOM
+    [stdlib: threading.RLock] as THREAD
+    [Docker Engine + cloudflared] as DOCKER
+    note bottom: Zero-deps Patches A1-A7\n(Beyond yaml, sqlite3, pytest)
+}
+
+' Layer-Dependencies (top-down only)
+L5 --> L4 : invokes Saga
+L4 --> L3 : uses Governance
+L3 --> L2 : reads/writes
+L2 --> L1 : runs on
+
+note as Disc
+  Layer-Discipline:
+  - Each layer ONLY uses N-1
+  - L1 has zero KMO-deps
+  - L2 has only L1 deps
+  - L3 patches independent
+  - L4 = pure orchestration
+  - L5 = read-only outward
+end note
+
+note as Sec
+  Security-Boundaries:
+  - L5 -> Internet (RO via CF)
+  - L3 -> Cross-Machine (Drive-Sync)
+  - L2 -> Same-Host only (no network)
+  - L1 -> Container-Isolated
+end note
+
+note as Patches
+  Patch-zu-Layer-Mapping:
+  L3 = ALLE 6 Patches:
+   A1 LeaseManager
+   A2 SagaEngine (auch L4)
+   A3 Outbox
+   A4 ApprovalGate
+   A5 DataClassFilter
+   A7 DurableStateMachine (auch L4)
+end note
+
+@enduml

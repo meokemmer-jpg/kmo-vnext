@@ -1,0 +1,106 @@
+@startuml 02-class-lease-manager
+' KMO A1 LeaseManager -- UML Class-Diagram [CRUX-MK]
+' Audience: Board + CTO. Zeigt SQLite-WAL-Constraint + Decorator-Composition.
+
+skinparam classAttributeIconSize 0
+skinparam class {
+    BackgroundColor #E3F2FD
+    BorderColor #1565C0
+    ArrowColor #1565C0
+}
+
+title A1 -- LeaseManager (SQLite-WAL Atomic Mutex)
+
+enum ResourceType <<enum.Enum>> {
+    + DF = "DF"
+    + PORT = "PORT"
+    + API_TOKEN = "API_TOKEN"
+    + DRIVE_PATH = "DRIVE_PATH"
+    + TUNNEL_SUBDOMAIN = "TUNNEL_SUBDOMAIN"
+}
+
+class LeaseInfo <<dataclass(frozen)>> {
+    + lease_id : str
+    + resource_type : str
+    + resource_id : str
+    + holder : str
+    + acquired_at : float
+    + expires_at : float
+    + last_heartbeat : float
+    + metadata : Optional[dict]
+    --
+    + {property} is_expired : bool
+}
+
+class LeaseManager {
+    + {static} DEFAULT_TTL_SEC : int = 300
+    + {static} HEARTBEAT_INTERVAL_SEC : int = 60
+    --
+    - _db_path : Path
+    - _stop_flag_dir : Path
+    - _schema_path : Path
+    - _lock : threading.RLock
+    --
+    + __init__(db_path, stop_flag_dir, schema_path)
+    + acquire(resource_type: ResourceType, resource_id: str, holder: str, ttl_sec: int, metadata: Optional[dict]) : Optional[str]
+    + release(lease_token: str) : bool
+    + heartbeat(lease_token: str, ttl_sec: int) : bool
+    + is_locked(resource_type: ResourceType, resource_id: str) : Optional[LeaseInfo]
+    + force_release_stale() : List[str]
+    + list_active() : List[LeaseInfo]
+    + get_by_token(lease_token: str) : Optional[LeaseInfo]
+    + respect_stop_flag(resource_id: str) : bool
+    --
+    - _connect() : sqlite3.Connection
+    - _ensure_schema() : None
+    - _row_to_lease_info(row) : LeaseInfo
+}
+
+class with_lease <<decorator>> {
+    + manager : LeaseManager
+    + resource_type : ResourceType
+    + resource_id_func : Callable[..., str]
+    + holder_func : Optional[Callable[..., str]]
+    + ttl_sec : int = 300
+    + heartbeat_interval_sec : int = 60
+    + raise_on_acquire_fail : bool = True
+    --
+    + __call__(func) : decorated_func
+    + _spawn_heartbeat_thread() : Thread
+}
+
+class LeaseAcquireFailed <<Exception>> {
+    + resource_type : ResourceType
+    + resource_id : str
+    + reason : str
+}
+
+database "SQLite-WAL" as DB {
+    + leases (table)
+    + idx_leases_resource_unique (UNIQUE)
+    + idx_leases_expires_at
+    + idx_leases_holder
+}
+
+note right of LeaseManager::acquire
+    INSERT OR IGNORE
+    + UNIQUE(resource_type,
+             resource_id)
+    = atomic mutex.
+    Returns None on conflict
+    or active STOP-flag.
+end note
+
+note bottom of with_lease
+    Spawns daemon-thread that
+    refreshes TTL every 60s.
+    Auto-release in finally{}.
+end note
+
+LeaseManager ..> LeaseInfo : returns
+LeaseManager ..> ResourceType : keyed_by
+LeaseManager ..> DB : SQL_ops
+with_lease *-- LeaseManager : composes
+with_lease ..> LeaseAcquireFailed : raises_on_fail
+
+@enduml

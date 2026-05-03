@@ -1,0 +1,55 @@
+# KMO Data-Class Filter Provider-Compatibility-Matrix
+# [CRUX-MK] - Implements KMO v0.2.0 P-KMO-A5
+#
+# Per Provider: max_data_class = highest DataClass that may be routed.
+# DataClass-Hierarchy (IntEnum):
+#   PUBLIC=1 (no constraint)
+#   INTERNAL=2 (only providers with documented data-contract)
+#   CONFIDENTIAL=3 (Claude-Opus + local Ollama only)
+#   SECRET=4 (NEVER routed to any LLM - architect + encrypted-storage only)
+#
+# Note: NO provider has SECRET (4) as max_data_class. SECRET is fail-closed by design.
+
+providers:
+  # Anthropic-Family (high-trust, paid plan with data-contract)
+  claude-opus:
+    max_data_class: CONFIDENTIAL  # 3 - Hard-no-delegate target for K_0/Q_0
+    rationale: "Anthropic Pro/MAX with no-train clause; suitable for CONFIDENTIAL"
+
+  claude-sonnet:
+    max_data_class: CONFIDENTIAL  # 3
+    rationale: "Same Anthropic data-contract; sonnet reserve nutzen per sonnet-opus-routing"
+
+  claude-haiku:
+    max_data_class: INTERNAL  # 2
+    rationale: "Lower-tier; only for routine-classification of non-confidential data"
+
+  # OpenAI-Family (Codex/ChatGPT-Pro)
+  codex-gpt5.5:
+    max_data_class: INTERNAL  # 2
+    rationale: "ChatGPT Pro paid plan with data-policy; max INTERNAL per chatgpt-pro-first.md"
+
+  # Google-Family
+  gemini-2.5-pro:
+    max_data_class: INTERNAL  # 2
+    rationale: "Gemini Ultra bundle paid plan; INTERNAL OK with documented contract"
+
+  # xAI-Family (Grok Heavy)
+  grok-4.20:
+    max_data_class: INTERNAL  # 2
+    rationale: "SuperGrok Heavy paid plan; INTERNAL OK"
+
+  # GitHub Copilot
+  copilot-pro:
+    max_data_class: INTERNAL  # 2
+    rationale: "Copilot Pro+ flat ($39/Mo); INTERNAL OK for code-tasks"
+
+  # Perplexity
+  perplexity-ultimate:
+    max_data_class: PUBLIC  # 1
+    rationale: "Web-search context shared with index; only PUBLIC research"
+
+  # Local Ollama (CONFIDENTIAL allowed - no network egress)
+  ollama-local:
+    max_data_class: CONFIDENTIAL  # 3
+    rationale: "Local Mac inference; no data leaves device; same trust as Claude-Opus"

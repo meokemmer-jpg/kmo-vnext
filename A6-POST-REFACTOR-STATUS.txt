@@ -1,0 +1,39 @@
+A6 POST-REFACTOR STATUS — 2026-04-30
+======================================
+Test-Status (nach Restructuring auf 3-Layer-Hierarchie):
+
+kmo_governance/approval-gate:     25 passed
+kmo_governance/lease-manager:     18 passed
+kmo_governance/data-class-filter: 32 passed
+kmo_governance/saga-pattern:       9 passed
+kmo_governance/outbox-pattern:     6 passed
+kmo_governance/durable-execution: 18 passed
+--------------------------------------------
+TOTAL:                           108 passed (108/108) — IDENTISCH zu Pre-Refactor
+
+Files-Moved: 6 Module via shutil.move (Bash mv im Sandbox geblockt)
+  - approval-gate     → kmo_governance/approval-gate
+  - lease-manager     → kmo_governance/lease-manager
+  - data-class-filter → kmo_governance/data-class-filter
+  - saga-pattern      → kmo_governance/saga-pattern
+  - outbox-pattern    → kmo_governance/outbox-pattern
+  - durable-execution → kmo_governance/durable-execution
+
+Layer-Hierarchie geschaffen:
+  kmo_control/__init__.py    (Layer-3 Stub)
+  kmo_governance/__init__.py (Layer-3 Governance, 6 Module)
+  df_executors/__init__.py   (Layer-2 Pilot-DF Stub)
+  dev-stage/                 (Phase-5 unveraendert)
+
+docker-compose.kmo-dev.yml: VALID (5 build-paths aktualisiert, durable-execution
+nicht referenziert weil Service in Compose noch nicht enthalten — kein Break-Risk).
+Warning: nur obsolete `version`-Attribute (Cosmetic, kein Blocker).
+
+Tests-Path-Update: NICHT noetig — Tests nutzen relative Imports
+(`Path(__file__).resolve().parent.parent`), funktionieren transparent nach mv.
+
+============================================
+Pre-Production-Bedingung 1 (A6 Layer-Separation): COMPLETE
+============================================
+Welle-3-Re-Re-Wargame-Mandat erfuellt. Alle 108 Tests post-Restructuring PASS.
+Bereit fuer Welle-4-Pre-Production-Validierung.

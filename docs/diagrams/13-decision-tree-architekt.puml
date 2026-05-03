@@ -1,0 +1,142 @@
+@startuml 13-decision-tree-architekt
+' KMO Architecture-Decision-Records -- Decision-Tree mit Trade-offs [CRUX-MK]
+' Audience: Board + CTO. 3 ARCHITEKT-DECIDED-DCs als Decision-Tree.
+
+skinparam activity {
+    BackgroundColor<<DC>> #E1F5FE
+    BorderColor<<DC>> #0277BD
+    BackgroundColor<<Win>> #C8E6C9
+    BorderColor<<Win>> #2E7D32
+    BackgroundColor<<Loss>> #FFCCBC
+    BorderColor<<Loss>> #BF360C
+    BackgroundColor<<TradeOff>> #FFF8E1
+    BorderColor<<TradeOff>> #EF6C00
+}
+
+title KMO Architecture-Decision-Records (3 ARCHITEKT-DECIDED-DCs)
+
+start
+
+partition "DC-A1: LeaseManager Backend (Welle 1)" {
+    if (Single-Owner Mac\nOR Multi-Machine?) then (Single-Owner)
+        :Option A: SQLite-WAL\nlocal file UNIQUE constraint <<DC>>;
+        note right
+            + Atomic in-process
+            + Zero-deps
+            + Drive-Sync compatible
+            - Mac-only mutex
+            - No Cross-Machine lock
+        end note
+        if (Acceptable trade-off?) then (yes)
+            :CHOSEN: SQLite-WAL <<Win>>;
+        else (no)
+            stop
+        endif
+    else (Multi-Machine)
+        :Option B: Redis SETNX <<Loss>>;
+        note right
+            - External dep
+            - Single-Point-of-Failure
+            - Overkill for Lambda
+        end note
+        :Option C: Cloud-Lock-Service <<Loss>>;
+        note right
+            - 3rd-party dep
+            - Network-Latency
+            - Vendor lock-in
+        end note
+        :Defer to OQ-2:\nCross-Machine-Lease offen <<TradeOff>>;
+    endif
+}
+
+partition "DC-A4: Approval-Gate-Pattern (Welle 4)" {
+    if (Single-Stage OR Dual-Control\nfor Production?) then (Single-Stage)
+        :Option A: HMAC + Single-Token <<Loss>>;
+        note right
+            - Insider risk:
+              1 person can deploy
+            - K_0 risk hoch
+        end note
+    else (Dual-Control)
+        :Option B: Dual-Sig + Atomic-TX <<DC>>;
+        note right
+            + 3-way disjoint identities
+            + BEGIN IMMEDIATE atomic
+            + Hash-Chain audit
+            + K_0 protected
+            - More complex
+        end note
+        if (Atomicity acceptable?) then (yes)
+            :CHOSEN: Dual + Atomic <<Win>>;
+            note right
+                pre_deploy_atomic():
+                BEGIN IMMEDIATE TX
+                + verify dual
+                + consume primary
+                + consume secondary
+                + acquire deploy_lock
+                + audit append
+                COMMIT or ROLLBACK
+            end note
+        else (no)
+            stop
+        endif
+    endif
+}
+
+partition "DC-A7: Durable-Execution-Pattern (Welle 7)" {
+    if (External Engine OR Self-Built?) then (External)
+        :Option A: Temporal.io <<Loss>>;
+        note right
+            - Heavy infra (Cassandra/etc)
+            - Steep learning curve
+            - Vendor lock-in
+            - Overkill for KMO Lambda
+        end note
+        :Option B: AWS Step Functions <<Loss>>;
+        note right
+            - Cloud lock-in
+            - Pricing per transition
+            - K_0 consideration: data sovereignty
+        end note
+    else (Self-Built)
+        :Option C: JSON Event-Sourcing <<DC>>;
+        note right
+            + Zero-deps (stdlib only)
+            + Atomic-Write via os.replace
+            + Snapshot-Replay
+            + Crash-Recovery in stdlib
+            + Full data control
+            - Self-maintenance burden
+            - No built-in distribution
+        end note
+        if (Conservative-Pick OK?) then (yes)
+            :CHOSEN: Self-Built JSON-EventStore <<Win>>;
+            note right
+                events.jsonl + fsync
+                snapshots/<seq>.json
+                state.lock/ mkdir-mutex
+                _apply_event() replay
+            end note
+        else (no)
+            stop
+        endif
+    endif
+}
+
+partition "Verdict: ALL 3 ARCHITEKT-DECIDED" {
+    :CROSS-LLM-2OF3-HARDENED for DEV <<Win>>;
+    :PRE-PRODUCTION for prod <<TradeOff>>;
+    note right
+        Cross-LLM-Wargames:
+        Codex GPT-5.4 + Gemini 2.5 + Claude Opus
+        konvergent ADOPT-PILOT-ONLY.
+
+        Approval-Gate-Token Pflicht
+        for Production.
+    end note
+}
+
+stop
+
+@enduml

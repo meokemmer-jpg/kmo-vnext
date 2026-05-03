@@ -1,0 +1,179 @@
+@startuml 12-component-3-layer
+' KMO 3-Layer-Hierarchy -- Component-Diagram (Tiefer als Mermaid) [CRUX-MK]
+' Audience: Board + CTO. ALLE Inter-Dependencies (Imports/Calls/Data-Flows).
+
+skinparam component {
+    BackgroundColor<<L1>> #E1F5FE
+    BorderColor<<L1>> #0277BD
+    BackgroundColor<<L2A>> #FFEBEE
+    BorderColor<<L2A>> #C62828
+    BackgroundColor<<L2B>> #E3F2FD
+    BorderColor<<L2B>> #1565C0
+    BackgroundColor<<L2C>> #FFF8E1
+    BorderColor<<L2C>> #EF6C00
+    BackgroundColor<<L3>> #C8E6C9
+    BorderColor<<L3>> #2E7D32
+    BackgroundColor<<DEV>> #F3E5F5
+    BorderColor<<DEV>> #6A1B9A
+}
+skinparam interface {
+    BackgroundColor #FFFFFF
+}
+
+title KMO 3-Layer Component-Hierarchy mit Dependencies (deeper than Mermaid)
+
+package "Layer 1: kmo_control" <<L1>> {
+    [Control-Plane] <<L1>> as CTRL
+    interface "Routing-API" as IRT
+    interface "Pipeline-Lifecycle" as IPL
+    CTRL -- IRT
+    CTRL -- IPL
+    note bottom of CTRL
+        Heute Stub.
+        Reserved fuer:
+        - Phase-Orchestration
+        - Routing-Decision-Tree
+        - DF-Selection-Logic
+    end note
+}
+
+package "Layer 2: kmo_governance (6 Patches)" {
+
+    package "A5 data-class-filter" <<L2A>> {
+        [DataClassFilter] <<L2A>> as DCF
+        [provider_compat.yaml] <<L2A>> as DCF_YAML
+        DCF ..> DCF_YAML : reads
+    }
+
+    package "A1 lease-manager" <<L2B>> {
+        [LeaseManager] <<L2B>> as LM
+        [with_lease decorator] <<L2B>> as LM_DEC
+        [schema.sql] <<L2B>> as LM_SQL
+        database "leases.db\n(SQLite-WAL)" as LM_DB
+        LM ..> LM_SQL : ensures
+        LM ..> LM_DB : writes
+        LM_DEC ..> LM : composes
+    }
+
+    package "A4 approval-gate" <<L2B>> {
+        [ApprovalGate] <<L2B>> as AG
+        [AuditLog] <<L2B>> as AL
+        [authorized_identities.yaml] <<L2B>> as AG_YAML
+        database "approval_gate.db" as AG_DB
+        AG ..> AL : append_within_TX
+        AG ..> AG_YAML : loads_authorized
+        AG ..> AG_DB : writes
+        AL ..> AG_DB : audit_chain_table
+    }
+
+    package "A7 durable-execution" <<L2C>> {
+        [DurableStateMachine] <<L2C>> as DSM
+        [event_types.py\nconstructors] <<L2C>> as DSM_EVT
+        folder "state_root/" as DSM_FS {
+            file "events.jsonl" as DSM_LOG
+            file "snapshots/" as DSM_SNAP
+            file "state.lock/" as DSM_LOCK
+        }
+        DSM ..> DSM_EVT : factory
+        DSM ..> DSM_LOG : appends
+        DSM ..> DSM_SNAP : every_10
+        DSM ..> DSM_LOCK : mutex
+    }
+
+    package "A2 saga-pattern" <<L2C>> {
+        [SagaEngine] <<L2C>> as SE
+        [phase_registry.py] <<L2C>> as SE_REG
+        folder "state_dir/" as SE_FS {
+            file "<run_id>.json" as SE_STATE
+        }
+        SE ..> SE_REG : optional_helper
+        SE ..> SE_STATE : atomic_write
+    }
+
+    package "A3 outbox-pattern" <<L2C>> {
+        [OutboxProducer] <<L2C>> as OBP
+        [OutboxConsumer] <<L2C>> as OBC
+        [atomic_write_json] <<L2C>> as OBJW
+        database "producer-state.db" as OB_PDB
+        database "consumer-state.db" as OB_CDB
+        folder "outbox/, ack/, dlq/" as OB_FS
+        OBP ..> OBJW : uses
+        OBP ..> OB_PDB : counters
+        OBP ..> OB_FS : writes
+        OBC ..> OB_CDB : processed_events
+        OBC ..> OB_FS : reads_writes
+    }
+}
+
+package "Layer 3: df_executors" <<L3>> {
+    [DF-86 NLM-Producer] <<L3>> as DF86
+    [DF-87 Wargame] <<L3>> as DF87
+    [Future DFs (DF-88+)] <<L3>> as DFN
+    note bottom of DF86
+        Heute Stub.
+        Adapter erwartet:
+        - Lease via with_lease
+        - Outbox-Subscribe
+        - Saga-Phase-Callback
+    end note
+}
+
+package "DEV-Stage: dev-stage/" <<DEV>> {
+    [kmo_gateway_stub.py\n(FastAPI)] <<DEV>> as GW
+    [docker-compose.kmo-dev.yml] <<DEV>> as DCOMP
+    [setup-cloudflared.sh] <<DEV>> as CFSH
+    note bottom of GW
+        :8080 internal, :8081 host
+        /health + /audit endpoints
+        RO-mount audit
+    end note
+}
+
+' Layer-Boundary Dependencies (Layer N -> Layer N-1 NIE)
+CTRL ..> DCF : pre_routing_check()
+CTRL ..> LM : acquire/release
+CTRL ..> AG : pre_deploy_atomic
+CTRL ..> DSM : start_workflow/transition
+CTRL ..> SE : execute/resume
+CTRL ..> OBP : publish
+
+' Inter-Layer-2 (Layer 2 modules NEVER call other Layer 2 modules directly except documented)
+AG ..> AL : intra-package only
+
+' Layer 2 -> Layer 3 (executors subscribe)
+DF86 ..> OBC : subscribe + handle
+DF87 ..> OBC : subscribe + handle
+DFN ..> OBC : subscribe + handle
+
+' DEV-Stage cross-cutting
+GW ..> AL : RO-read for /audit
+GW ..> LM : RO-read for /leases
+DCOMP ..> DCF : containerizes
+DCOMP ..> LM : containerizes
+DCOMP ..> AG : containerizes
+DCOMP ..> SE : containerizes
+DCOMP ..> OBP : containerizes
+DCOMP ..> GW : composes
+
+note as Boundary
+    LAYER-DISCIPLINE-RULE:
+    - Layer N NEVER calls Layer N-1
+    - L1 orchestrates downward only
+    - L2 modules invariant-only
+    - L3 are data-clients of L2-Outbox
+    - Cross-L2-calls limited and documented
+end note
+
+note as DataClassDisable
+    Note: Patches A1-A7 sind 6 Patches.
+    Numbering folgt SPEC-Reihenfolge:
+    A1 = Lease (Welle 1)
+    A2 = Saga (Welle 6)
+    A3 = Outbox (Welle 5)
+    A4 = Approval (Welle 4)
+    A5 = DataClass (Welle 3)
+    A7 = Durable (Welle 7)
+    A6 = (reserved)
+end note
+
+@enduml

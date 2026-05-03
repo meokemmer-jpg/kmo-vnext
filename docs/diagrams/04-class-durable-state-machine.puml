@@ -1,0 +1,119 @@
+@startuml 04-class-durable-state-machine
+' KMO A7 DurableStateMachine -- UML Class-Diagram [CRUX-MK]
+' Audience: Board + CTO. Event-Sourcing + Crash-Recovery + Snapshot.
+
+skinparam classAttributeIconSize 0
+skinparam class {
+    BackgroundColor #FFF8E1
+    BorderColor #EF6C00
+    ArrowColor #EF6C00
+}
+
+title A7 -- DurableStateMachine (Event-Sourcing + Crash-Recovery)
+
+enum WorkflowStatus <<str, Enum>> {
+    + PENDING = "PENDING"
+    + RUNNING = "RUNNING"
+    + PAUSED = "PAUSED"
+    + DONE = "DONE"
+    + FAILED = "FAILED"
+    + ABORTED = "ABORTED"
+}
+
+enum EventType <<str, Enum>> {
+    + ROUTING_DECISION
+    + DF_STATUS_CHANGE
+    + STOP_FLAG_TRANSITION
+    + APPROVAL_STATE
+    + WORKFLOW_STARTED
+    + STATE_TRANSITION
+    + SNAPSHOT_TAKEN
+}
+
+class Event <<dataclass(frozen)>> {
+    + event_id : str
+    + workflow_id : str
+    + event_type : EventType
+    + timestamp : float
+    + sequence : int
+    + payload : dict
+    + actor : Optional[str]
+    + correlation_id : Optional[str]
+    --
+    + to_dict() : dict
+    + {static} from_dict(d: dict) : Event
+}
+
+class WorkflowRun <<dataclass>> {
+    + workflow_id : str
+    + current_phase : str
+    + status : WorkflowStatus
+    + state_data : dict
+    + sequence : int
+    + created_at : float
+    + updated_at : float
+    --
+    + to_dict() : dict
+    + {static} from_dict(d: dict) : WorkflowRun
+}
+
+class DurableStateMachine {
+    - _state_root : Path
+    - _snapshot_every_n : int
+    - _lock_stale_after_s : float
+    --
+    + __init__(state_root: Path, snapshot_every_n_events: int, lock_stale_after_s: float)
+    + start_workflow(workflow_id: str, initial_state: Optional[dict], initial_phase: str) : WorkflowRun
+    + transition(workflow_id: str, event_type: EventType, payload: dict, actor: Optional[str], correlation_id: Optional[str]) : WorkflowRun
+    + transition_phase(workflow_id: str, from_phase: str, to_phase: str, state_patch: Optional[dict], actor: Optional[str]) : WorkflowRun
+    + recover(workflow_id: str) : WorkflowRun
+    + snapshot(workflow_id: str) : WorkflowRun
+    + get_history(workflow_id: str) : list[Event]
+    + list_workflows() : list[str]
+    --
+    - _acquire_fs_lock(workflow_id: str) : None
+    - _release_fs_lock(workflow_id: str) : None
+    - _append_event(event: Event) : None
+    - _read_events(workflow_id: str) : list[Event]
+    - _apply_event(run: WorkflowRun, event: Event) : WorkflowRun
+    - _read_latest_snapshot(workflow_id: str) : Optional[WorkflowRun]
+    - _write_snapshot(run: WorkflowRun) : None
+    - _next_sequence(workflow_id: str) : int
+}
+
+class EventConstructors <<module>> {
+    + make_routing_decision(...) : Event
+    + make_df_status_change(...) : Event
+    + make_stop_flag_transition(...) : Event
+    + make_approval_state(...) : Event
+    + make_state_transition(...) : Event
+}
+
+class WorkflowNotFoundError <<Exception>> {}
+class ConcurrentTransitionError <<Exception>> {}
+
+note right of DurableStateMachine
+    Storage-Layout:
+    state_root/<wf-id>/
+       events.jsonl  (append-only, fsync)
+       snapshots/<seq:010d>.json (every 10)
+       state.lock/   (mkdir-mutex, TTL 300s)
+end note
+
+note bottom of DurableStateMachine::recover
+    1. Read latest snapshot
+    2. Read events.jsonl
+    3. Filter events where seq > snapshot.sequence
+    4. Replay via _apply_event() in order
+    5. Return materialized WorkflowRun
+end note
+
+DurableStateMachine *-- Event : produces
+DurableStateMachine *-- WorkflowRun : materializes
+DurableStateMachine ..> WorkflowNotFoundError : raises
+DurableStateMachine ..> ConcurrentTransitionError : raises
+Event *-- EventType : has
+WorkflowRun *-- WorkflowStatus : has
+EventConstructors ..> Event : factory
+
+@enduml

@@ -1,0 +1,142 @@
+@startuml 07-sequence-e2e-pipeline
+' KMO E2E Pipeline -- Sequence-Diagram mit Activations [CRUX-MK]
+' Audience: Board + CTO. ALLE 6 Patches in EINER End-to-End-Sequenz.
+
+skinparam sequenceMessageAlign center
+skinparam SequenceGroupBackgroundColor #F0F8FF
+skinparam SequenceGroupBorderColor #1565C0
+skinparam SequenceArrowFontStyle italic
+
+title KMO E2E Pipeline -- Happy-Path mit Failure-Branches
+
+actor "Control-Plane" as CTRL
+participant "A5\nDataClassFilter" as DCF #FFEBEE
+participant "A1\nLeaseManager" as LM #E3F2FD
+participant "A4\nApprovalGate" as AG #E3F2FD
+participant "A4\nAuditLog" as AL #E3F2FD
+participant "A7\nDurableStateMachine" as DSM #FFF8E1
+participant "A2\nSagaEngine" as SE #FFF8E1
+participant "A3\nOutboxProducer" as OBP #FFF8E1
+participant "A3\nOutboxConsumer" as OBC #FFF8E1
+database "SQLite-WAL" as DB
+database "events.jsonl" as JSONL
+database "outbox/" as OUT
+
+== Phase 1: Data-Class Pre-Routing-Check ==
+CTRL -> DCF ++ : pre_routing_check(prompt, target_provider)
+DCF -> DCF : classify_input()
+DCF -> DCF : _detect_secret_patterns()
+DCF -> DCF : is_provider_allowed(class, provider)
+
+alt SECRET detected
+    DCF --> CTRL : RoutingDecision(allowed=False, BLOCK)
+    note right
+        K_0 protected.
+        Pipeline STOPS here.
+    end note
+else PUBLIC/INTERNAL/CONFIDENTIAL OK
+    DCF --> CTRL -- : RoutingDecision(allowed=True)
+end
+
+== Phase 2: Lease Acquire ==
+CTRL -> LM ++ : acquire(DF, "df-86", holder, ttl_sec=300)
+LM -> LM : respect_stop_flag()
+LM -> DB : INSERT OR IGNORE INTO leases\n(UNIQUE constraint)
+DB --> LM : rowcount
+
+alt rowcount=0 (Conflict)
+    LM -> LM : force_release_stale()
+    LM -> DB : retry INSERT OR IGNORE
+    LM --> CTRL : None (still locked)
+    note right: Pipeline waits or aborts
+else rowcount=1 (Success)
+    LM --> CTRL -- : lease_token (UUID)
+end
+
+== Phase 3: Approval Verify (Atomic) ==
+CTRL -> AG ++ : pre_deploy_atomic(dual_token, resource, action, holder)
+AG -> DB : BEGIN IMMEDIATE TX
+AG -> AG : verify_dual_token() (read-only)
+AG -> DB : _consume_token_in_tx(primary.nonce)
+AG -> DB : _consume_token_in_tx(secondary.nonce)
+AG -> DB : INSERT INTO deploy_locks
+AG -> AL ++ : append_within_transaction(action, resource, requester)
+AL -> AL : compute_block_hash(prev_hash + entry)
+AL -> DB : INSERT INTO audit_chain
+AL --> AG -- : AuditEntry
+AG -> DB : COMMIT (or ROLLBACK on error)
+AG -> AL : flush_entry_to_jsonl(entry)
+AL -> JSONL : append entry.to_json_line()
+AG --> CTRL -- : True (atomic ok)
+
+== Phase 4: Workflow Start (Durable) ==
+CTRL -> DSM ++ : start_workflow("wf-001", initial_state)
+DSM -> DSM : _acquire_fs_lock(workflow_id)
+DSM -> DSM : _next_sequence() = 1
+DSM -> JSONL : append WORKFLOW_STARTED\n(seq=1) + fsync
+DSM -> DSM : _release_fs_lock()
+DSM --> CTRL -- : WorkflowRun(status=RUNNING)
+
+== Phase 5: Saga Execute (7 Phases) ==
+CTRL -> SE ++ : execute("saga-001", initial_input)
+loop forall p in [Plan, Spec, Wargame, Build, Test, DEV-Demo, Approval]
+    SE -> SE : do_func(input, ctx)
+
+    opt exit_criteria defined
+        SE -> SE : check_exit_criteria(output)
+        alt exit fails
+            SE -> SE : status = FAILED
+            note right
+                Triggers
+                _compensate()
+                in REVERSE order
+            end note
+        end
+    end
+
+    SE -> SE : _atomic_write_state(run)
+    note left: tempfile + flush + fsync + os.replace
+end
+
+alt All 7 phases DONE
+    SE --> CTRL : SagaResult(DONE, phases_done=7)
+else Phase fails
+    SE -> SE : _compensate(run)
+    loop reversed phases (only DONE)
+        SE -> SE : undo_func(input, output, ctx)
+    end
+    SE --> CTRL -- : SagaResult(COMPENSATED, phases_undone=N)
+end
+
+== Phase 6: Outbox Publish (Cross-Machine) ==
+CTRL -> OBP ++ : publish("kmo-pipeline", payload, event_id=UUID4)
+OBP -> OBP : _next_seq("kmo-pipeline") = 1
+OBP -> OUT : atomic_write_json(envelope)
+note right: Drive-Sync replicates to other machine
+OBP --> CTRL -- : EventEnvelope(seq=1)
+
+== Cleanup ==
+CTRL -> LM ++ : release(lease_token)
+LM -> DB : DELETE FROM leases\nWHERE lease_id=?
+LM --> CTRL -- : True
+
+== Phase 7: Async Cross-Machine Consumer ==
+group Cross-Machine (Drive-Sync, 2-30s delay)
+    OBC -> OUT : glob *.json
+    OUT --> OBC : [envelope_1]
+    OBC -> OBC : _is_processed("event_id")?
+
+    alt Already processed
+        OBC -> OBC : skipped_idempotent++
+    else New event
+        OBC -> OBC : handler(envelope)
+        alt handler success
+            OBC -> OUT : write ack-file
+            OBC -> OBC : _record_attempt(success=True)
+        else handler raises 3 times
+            OBC -> OUT : move_to_dlq("retry_exceeded")
+        end
+    end
+end
+
+@enduml

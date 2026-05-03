@@ -1,0 +1,143 @@
+@startuml 08-deployment-docker
+' KMO DEV-Stage Deployment-Diagram [CRUX-MK]
+' Audience: Board + CTO. Docker-Compose Network + Volumes + Healthchecks.
+
+skinparam node {
+    BackgroundColor #F3E5F5
+    BorderColor #6A1B9A
+}
+skinparam component {
+    BackgroundColor #FFFFFF
+    BorderColor #424242
+}
+skinparam database {
+    BackgroundColor #E1F5FE
+    BorderColor #01579B
+}
+
+title KMO DEV-Stage Deployment (Mac-Local Docker + Cloudflare-Tunnel)
+
+cloud "Internet (CTO/Board)" as INET {
+    actor "Reviewer" as REV
+}
+
+node "Cloudflare Edge" as CFEDGE {
+    component "Public-URL\n(*.trycloudflare.com)" as PURL
+}
+
+node "Mac-Local Docker Host" as MAC {
+
+    node "Docker Network: kmo-net (bridge)" as NET {
+
+        component "kmo-cloudflared\n(tunnel)" as CF {
+            note bottom
+                cloudflare/cloudflared:latest
+                cmd: tunnel --no-autoupdate run
+                env: TUNNEL_TOKEN
+                depends_on: kmo-gateway healthy
+            end note
+        }
+
+        component "kmo-gateway\n:8080 internal\n:8081 host-port" as GW {
+            note bottom
+                FastAPI :8080
+                healthcheck: GET /health
+                interval: 15s, retries: 3
+                env: KMO_DEMO_AUTH_USER/PASS
+                CRUX-MK: K_0 read-only audit
+            end note
+        }
+
+        component "kmo-data-class-filter" as DCFC #FFEBEE {
+            note bottom
+                Python module
+                healthcheck: import sys exit 0
+                env: KMO_LOG_LEVEL=DEBUG
+            end note
+        }
+
+        component "kmo-lease-manager" as LMC #E3F2FD {
+            note bottom
+                SQLite-WAL on volume
+                env: KMO_LOG_LEVEL
+                vol: kmo-data:/app/data
+            end note
+        }
+
+        component "kmo-approval-gate" as AGC #E3F2FD {
+            note bottom
+                env: KMO_APPROVAL_SECRET (32B+)
+                Read-only secret in DEV
+            end note
+        }
+
+        component "kmo-saga-engine" as SEC #FFF8E1 {
+            note bottom
+                JSON state-files
+                healthcheck: import sys
+            end note
+        }
+
+        component "kmo-outbox" as OBC #FFF8E1 {
+            note bottom
+                Producer/Consumer
+                Drive-Sync mount expected
+            end note
+        }
+    }
+
+    folder "Docker Volumes" as VOLS {
+        database "kmo-data\n(driver: local)" as VDATA {
+            note right: SQLite-WAL files\nLease + Approval DBs
+        }
+        database "kmo-audit\n(bind-mount, RO)" as VAUDIT {
+            note right
+                Bind: <Drive>/branch-hub/audit/
+                Mode: read-only
+                For demo dashboard only.
+            end note
+        }
+    }
+
+    folder "Host Filesystem" as FS {
+        artifact "branch-hub/audit/\n(GoogleDrive)" as HOSTAUDIT
+        artifact "branch-hub/outbox/\n(GoogleDrive)" as HOSTOUT
+    }
+}
+
+REV --> PURL : HTTPS
+PURL --> CF : tunnel-protocol
+CF --> GW : HTTP :8080
+
+GW --> VAUDIT : RO mount /app/audit
+GW --> VDATA : RW mount /app/data
+
+LMC --> VDATA
+SEC --> VDATA
+AGC --> VDATA
+
+VAUDIT --> HOSTAUDIT : bind
+OBC ..> HOSTOUT : Drive-Sync (host-volume)
+
+DCFC -[hidden]> LMC
+LMC -[hidden]> AGC
+AGC -[hidden]> SEC
+SEC -[hidden]> OBC
+
+note as N1
+  Healthcheck-Pflicht (alle Services):
+  interval: 15-30s
+  timeout: 5s
+  retries: 3
+  start_period: 5s
+end note
+
+note as N2
+  K_0/Q_0 Disziplin DEV-Stage:
+  - Keine echten Daten
+  - Keine Production-Secrets
+  - Audit RO mounted
+  - Public-URL nur fuer Demo
+end note
+
+@enduml

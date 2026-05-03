@@ -1,0 +1,216 @@
+@startuml 11-er-diagram-storage
+' KMO Storage-Schemas -- ER-Diagram [CRUX-MK]
+' Audience: Board + CTO. SQLite-Schemas + JSONL-Files + Filesystem-Layout.
+
+!define table(x) entity x << (T,#FFAAAA) >>
+!define index(x) entity x << (I,#AAFFAA) >>
+!define jsonl(x) entity x << (J,#AAAAFF) >>
+!define dir(x) entity x << (D,#FFE0B2) >>
+
+title KMO Storage-ER (SQLite + JSONL + Filesystem)
+
+package "lease-manager: leases.db (SQLite-WAL)" {
+    table(leases) {
+        + lease_id : TEXT (PK, UUID4)
+        --
+        # resource_type : TEXT (NOT NULL)
+        # resource_id : TEXT (NOT NULL)
+        # holder : TEXT (NOT NULL)
+        --
+        acquired_at : REAL
+        expires_at : REAL
+        last_heartbeat : REAL
+        metadata_json : TEXT (nullable)
+    }
+
+    index(idx_leases_resource_unique) {
+        UNIQUE(resource_type, resource_id)
+        --
+        Atomic-Mutex Constraint
+    }
+
+    index(idx_leases_expires_at) {
+        ON expires_at
+        --
+        Stale-Cleanup Speed-Up
+    }
+
+    index(idx_leases_holder) {
+        ON holder
+        --
+        Reverse-Lookup ("welche Leases?")
+    }
+}
+
+package "approval-gate: approval_gate.db (SQLite)" {
+    table(tokens) {
+        + nonce : TEXT (PK)
+        --
+        requester : TEXT
+        resource : TEXT
+        action : TEXT
+        issued_at : INTEGER
+        expires_at : INTEGER
+        signature : TEXT
+        --
+        consumed : BOOL DEFAULT FALSE
+        consumed_at : INTEGER (nullable)
+    }
+
+    table(dual_tokens) {
+        + dual_id : TEXT (PK)
+        --
+        primary_nonce : TEXT (FK)
+        secondary_nonce : TEXT (FK)
+        requester : TEXT
+        resource : TEXT
+        action : TEXT
+    }
+
+    table(deploy_locks) {
+        + (resource, action) : COMPOSITE_PK
+        --
+        holder : TEXT
+        acquired_at : INTEGER
+        expires_at : INTEGER
+    }
+
+    table(audit_chain) {
+        + block_index : INTEGER (PK, AUTOINC)
+        --
+        timestamp : INTEGER
+        action : TEXT
+        resource : TEXT
+        requester : TEXT
+        approver_token_nonce : TEXT
+        --
+        prev_hash : TEXT (NOT NULL)
+        block_hash : TEXT (UNIQUE, hash-chain)
+    }
+}
+
+package "outbox-pattern: SQLite (per machine)" {
+    table(producer_counters) {
+        + (machine_id, topic) : COMPOSITE_PK
+        --
+        last_seq : INTEGER
+    }
+
+    table(processed_events) {
+        + event_id : TEXT (PK, UUID4)
+        --
+        topic : TEXT
+        attempt_count : INTEGER
+        success : BOOL
+        last_error : TEXT (nullable)
+        last_attempt_at : REAL
+    }
+}
+
+package "approval-gate: kmo-approval-chain.jsonl (Append-Only)" {
+    jsonl(approval_chain_jsonl) {
+        Line: JSON of AuditEntry
+        --
+        Hash-Chained:
+        block_hash[n] = SHA256(prev_hash || entry_payload)
+        --
+        Tamper-evident
+        verify_chain() reads ALL
+    }
+}
+
+package "data-class-filter: kmo-routing-decisions.jsonl (Append-Only)" {
+    jsonl(routing_decisions_jsonl) {
+        Line: JSON of RoutingDecision
+        --
+        Per pre_routing_check() call
+        Includes detected_patterns
+        K_0/Q_0 audit
+    }
+}
+
+package "durable-execution: state_root/<workflow_id>/ (FS)" {
+    dir(events_jsonl) {
+        events.jsonl (append-only)
+        --
+        Line: JSON of Event
+        fsync per append
+        Read by _read_events()
+    }
+
+    dir(snapshots_dir) {
+        snapshots/<seq:010d>.json
+        --
+        Auto every snapshot_every_n_events (10)
+        Format: WorkflowRun.to_dict()
+        Replay-Optimization
+    }
+
+    dir(state_lock) {
+        state.lock/ (mkdir-mutex)
+        --
+        Stale-TTL: 300s
+        Used by _acquire_fs_lock
+        ConcurrentTransitionError on lock conflict
+    }
+}
+
+package "saga-pattern: state_dir/<run_id>.json (FS)" {
+    dir(saga_state_json) {
+        <run_id>.json (atomic-write)
+        --
+        SagaRun.to_dict() full snapshot
+        tempfile + flush + fsync + os.replace
+        Crash mid-write IMPOSSIBLE
+    }
+}
+
+package "outbox-pattern: branch-hub/outbox*/ (Drive-Sync)" {
+    dir(outbox_dir) {
+        outbox/<machine>-<topic>-<seq:08d>.json
+        --
+        atomic_write_json()
+        Drive-Sync replicates
+        Idempotent via event_id
+    }
+
+    dir(ack_dir) {
+        outbox-ack/<...>.ack.json
+        --
+        Written after successful handler
+        Marks event processed
+    }
+
+    dir(dlq_dir) {
+        outbox-dlq/<...>.dlq.json
+        --
+        After MAX_RETRIES=3 fails
+        Manual re-inspection
+    }
+}
+
+' Cross-Package Relationships
+leases ||--o{ idx_leases_resource_unique : enforces
+leases ||--o{ idx_leases_expires_at : indexes
+leases ||--o{ idx_leases_holder : indexes
+
+audit_chain ||--|| approval_chain_jsonl : flushed_to
+tokens ||--|{ dual_tokens : "primary/secondary FK"
+tokens ||--o{ audit_chain : referenced_by_nonce
+
+producer_counters ||--o{ outbox_dir : drives_seq
+processed_events ||--o{ ack_dir : marks_via
+
+events_jsonl ||--o{ snapshots_dir : compacted_into
+saga_state_json ||--|| events_jsonl : independent_storage_separate
+
+note as N1
+  Cardinalities & Constraints:
+  - leases UNIQUE(type, id) - 1:1 active per resource
+  - audit_chain: linear hash-chain, no cycles
+  - dual_tokens: ALWAYS 2 token references
+  - outbox events: idempotent via event_id (UUID4)
+  - state_root: 1 dir per workflow_id (no nesting)
+end note
+
+@enduml

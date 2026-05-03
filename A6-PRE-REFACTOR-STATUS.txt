@@ -1,0 +1,19 @@
+A6 PRE-REFACTOR STATUS — 2026-04-30
+=====================================
+Test-Baseline (vor Restructuring):
+
+approval-gate:     25 passed (test_approval_gate + test_audit_log)
+lease-manager:     18 passed
+data-class-filter: 32 passed
+saga-pattern:       9 passed
+outbox-pattern:     6 passed
+durable-execution: 18 passed
+-------------------------------------
+TOTAL:            108 passed (108/108)
+
+Note: Auftrag erwartete 119 Tests (101 Welle-1+2+3 + 18 Welle-4-A4.2). Tatsaechlich 108.
+Abweichung um 11 — moeglicherweise Welle-4-A4.2 noch nicht voll integriert oder Tests
+bereits konsolidiert. Baseline 108 ist verbindliche Pre-Status-Referenz.
+
+Files-State: 6 Module flat in kmo/ + dev-stage/ vorhanden.
+Refactor-Ziel: kmo_governance/{6 Module} + kmo_control/__init__.py + df_executors/__init__.py

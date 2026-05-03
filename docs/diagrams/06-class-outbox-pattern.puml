@@ -1,0 +1,131 @@
+@startuml 06-class-outbox-pattern
+' KMO A3 Outbox-Pattern -- UML Class-Diagram [CRUX-MK]
+' Audience: Board + CTO. Cross-Machine + UUID4-Idempotenz + DLQ.
+
+skinparam classAttributeIconSize 0
+skinparam class {
+    BackgroundColor #FFF8E1
+    BorderColor #EF6C00
+    ArrowColor #EF6C00
+}
+
+title A3 -- Outbox-Pattern (Producer/Consumer Cross-Machine)
+
+class EventEnvelope <<dataclass>> {
+    + event_id : str (UUID4)
+    + machine_id : str
+    + topic : str
+    + seq : int
+    + timestamp : float
+    + payload : dict
+    + retry_count : int = 0
+    --
+    + to_dict() : dict
+    + {static} from_dict(d: dict) : EventEnvelope
+    + filename() : str
+}
+
+class atomic_write_json <<helper>> {
+    + (target: Path, data: dict) : None
+    --
+    tempfile_NamedTemporaryFile
+    + json.dump
+    + flush
+    + fsync
+    + os.replace
+}
+
+class OutboxProducer {
+    - _outbox_dir : Path
+    - _ack_dir : Path
+    - _machine_id : str
+    - _state_db : Path
+    --
+    + __init__(outbox_dir: Path, ack_dir: Path, machine_id: str, state_db: Path | None)
+    + publish(machine_id: str, topic: str, payload: dict, event_id: str | None) : EventEnvelope
+    + republish_failed_acks() : list[EventEnvelope]
+    --
+    - _next_seq(topic: str) : int
+    - _connect() : sqlite3.Connection
+    - _has_ack_file(envelope: EventEnvelope) : bool
+}
+
+class ConsumerStats <<dataclass>> {
+    + polled : int = 0
+    + processed : int = 0
+    + skipped_idempotent : int = 0
+    + failed : int = 0
+    + moved_to_dlq : int = 0
+    + errors : list[str]
+}
+
+class OutboxConsumer {
+    + {static} MAX_RETRIES : int = 3
+    --
+    - _consumer_id : str
+    - _outbox_dir : Path
+    - _ack_dir : Path
+    - _dlq_dir : Path
+    - _state_db : Path
+    - _topics : list[str]
+    - _handler : Callable[[EventEnvelope], None]
+    --
+    + __init__(consumer_id: str, outbox_dir: Path, ack_dir: Path, dlq_dir: Path, state_db: Path | None)
+    + subscribe(topics: list[str], handler_func: Callable[[EventEnvelope], None]) : None
+    + poll_and_process() : ConsumerStats
+    + acknowledge(event_id: str) : Path
+    + move_to_dlq(event_id: str, reason: str) : Path | None
+    --
+    - _is_processed(event_id: str) : bool
+    - _record_attempt(event_id: str, success: bool, error: Optional[str]) : None
+    - _retry_count(event_id: str) : int
+}
+
+database "Producer-State (SQLite)" as PDB {
+    + counters (machine_id, topic, last_seq)
+}
+
+database "Consumer-State (SQLite)" as CDB {
+    + processed_events (event_id, success, attempts)
+}
+
+folder "outbox/" as OUT {
+    file "<machine>-<topic>-<seq:08d>.json"
+}
+
+folder "outbox-ack/" as ACK {
+    file "<machine>-<topic>-<seq:08d>.ack.json"
+}
+
+folder "outbox-dlq/" as DLQ {
+    file "<machine>-<topic>-<seq:08d>.dlq.json"
+}
+
+note right of OutboxProducer::publish
+    1. _next_seq(topic) via SQLite
+    2. atomic_write_json to outbox/
+    3. Idempotent: same event_id -> dedupe
+end note
+
+note bottom of OutboxConsumer::poll_and_process
+    Pollt outbox once. Per file:
+    1. Parse envelope
+    2. _is_processed? skip
+    3. handler(env) call
+    4. ok: ack-file + DB-INSERT
+    5. fail: retry_count++
+    6. retry_count >= 3 -> DLQ
+end note
+
+OutboxProducer ..> EventEnvelope : creates
+OutboxProducer ..> atomic_write_json : uses
+OutboxProducer ..> PDB : tracks
+OutboxProducer ..> OUT : writes
+OutboxConsumer ..> EventEnvelope : reads
+OutboxConsumer ..> ConsumerStats : returns
+OutboxConsumer ..> CDB : tracks
+OutboxConsumer ..> OUT : reads
+OutboxConsumer ..> ACK : writes
+OutboxConsumer ..> DLQ : writes_after_3_retries
+
+@enduml

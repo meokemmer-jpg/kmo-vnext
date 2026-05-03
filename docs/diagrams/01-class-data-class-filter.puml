@@ -1,0 +1,74 @@
+@startuml 01-class-data-class-filter
+' KMO A5 DataClassFilter -- UML Class-Diagram [CRUX-MK]
+' Audience: Board + CTO. Tiefe: Methods + Type-Hints + Visibility.
+
+skinparam classAttributeIconSize 0
+skinparam classFontStyle bold
+skinparam class {
+    BackgroundColor #FFEBEE
+    BorderColor #C62828
+    ArrowColor #C62828
+}
+
+title A5 -- DataClassFilter (Pre-Routing-Hook)
+
+enum DataClass <<IntEnum>> {
+    + PUBLIC = 1
+    + INTERNAL = 2
+    + CONFIDENTIAL = 3
+    + SECRET = 4
+    --
+    + {static} from_tag(tag: str) : Optional[DataClass]
+}
+
+class RoutingDecision <<dataclass(frozen)>> {
+    + allowed : bool
+    + data_class : DataClass
+    + target_provider : str
+    + reason : str
+    + detected_patterns : tuple[str, ...]
+    --
+    + to_log_entry() : dict
+}
+
+class DataClassFilter {
+    - _config_path : Path
+    - _audit_log_path : Path
+    - _provider_compat : dict[str, DataClass]
+    --
+    + __init__(config_path: Optional[Path], audit_log_path: Optional[Path])
+    + classify_input(prompt: str, frontmatter: Optional[dict]) : DataClass
+    + is_provider_allowed(data_class: DataClass, provider: str) : bool
+    + pre_routing_check(prompt: str, target_provider: str, frontmatter: Optional[dict]) : RoutingDecision
+    --
+    - _load_provider_compat() : dict
+    - _detect_secret_patterns(prompt: str) : tuple[str, ...]
+    - _append_audit(decision: RoutingDecision) : None
+}
+
+class SECRET_PATTERNS <<tuple>> {
+    api_key, token, password, secret,
+    bearer_header, bearer_jwt, aws_key,
+    iban, credit_card, private_key
+}
+
+note right of DataClass
+    Hierarchy:
+    Higher value = stricter
+    SECRET (4) NEVER routed
+    to flat-LLMs
+end note
+
+note bottom of DataClassFilter
+    Fail-Closed-Default:
+    Unknown provider -> False
+    Unknown class -> SECRET
+    File-Audit: JSONL append-only
+end note
+
+DataClassFilter ..> DataClass : uses
+DataClassFilter ..> RoutingDecision : produces
+DataClassFilter ..> SECRET_PATTERNS : matches
+RoutingDecision *-- DataClass : has
+
+@enduml
