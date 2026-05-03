@@ -9,6 +9,7 @@ from .hotel_membrane import (
     DataCategory,
     GDPRComplianceLayer,
     HotelMembrane,
+    ast_check_hotel_id_filter,
 )
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "DataCategory",
     "GDPRComplianceLayer",
     "HotelMembrane",
+    "ast_check_hotel_id_filter",
 ]
 
 # CRUX-MK

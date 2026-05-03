@@ -164,3 +164,126 @@ def test_membrane_compatible_with_phase1_cell_boundary(tmp_path):
     import pytest
     with pytest.raises(PermissionError):
         mgr.assert_hotel_id(other_membrane.hotel_id)
+
+
+# ---------- Patch P3 AST-Query-Validator (Welle-9-gamma Open-Item #3 Gemini Finding) ----------
+
+
+def test_p3_ast_validator_passes_simple_legitimate_query():
+    """P3: einfache Query mit hotel_id-Filter im outer-WHERE besteht."""
+    from kmo_governance.hotel_membrane import ast_check_hotel_id_filter
+    sql = "SELECT * FROM bookings WHERE hotel_id = 'hotel-A'"
+    ok, reason = ast_check_hotel_id_filter(sql)
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_p3_ast_validator_blocks_subquery_only_filter():
+    """P3 (Gemini): hotel_id nur in Subquery, NICHT in outer-WHERE -> BLOCK."""
+    from kmo_governance.hotel_membrane import ast_check_hotel_id_filter
+    # Bypass-Versuch: outer-Query hat kein hotel_id, nur Subquery
+    sql = """
+        SELECT *
+        FROM bookings
+        WHERE booking_id IN (
+            SELECT booking_id FROM other_table WHERE hotel_id = 'hotel-A'
+        )
+    """
+    ok, reason = ast_check_hotel_id_filter(sql)
+    assert ok is False
+    assert "subquery" in reason
+
+
+def test_p3_ast_validator_blocks_or_clause_bypass():
+    """P3 (Gemini): WHERE hotel_id='X' OR 1=1 -> Filter ist void, BLOCK."""
+    from kmo_governance.hotel_membrane import ast_check_hotel_id_filter
+    sql = "SELECT * FROM bookings WHERE hotel_id = 'hotel-A' OR 1=1"
+    ok, reason = ast_check_hotel_id_filter(sql)
+    assert ok is False
+    assert "or" in reason
+
+
+def test_p3_ast_validator_blocks_negation_filter():
+    """P3 (Gemini): hotel_id != 'X' erlaubt Table-Scan, BLOCK."""
+    from kmo_governance.hotel_membrane import ast_check_hotel_id_filter
+    sql_neq = "SELECT * FROM bookings WHERE hotel_id != 'hotel-A'"
+    sql_lg = "SELECT * FROM bookings WHERE hotel_id <> 'hotel-A'"
+    sql_notin = "SELECT * FROM bookings WHERE hotel_id NOT IN ('hotel-A')"
+    for sql in (sql_neq, sql_lg, sql_notin):
+        ok, reason = ast_check_hotel_id_filter(sql)
+        assert ok is False, f"Should block negation: {sql}"
+        assert "negat" in reason or "scan" in reason
+
+
+def test_p3_ast_validator_blocks_comment_only_filter():
+    """P3 (Gemini): hotel_id-Filter nur in Kommentar, NICHT in echtem SQL -> BLOCK."""
+    from kmo_governance.hotel_membrane import ast_check_hotel_id_filter
+    # Bypass: regex sieht hotel_id, aber es ist auskommentiert
+    sql = """
+        SELECT * FROM bookings
+        -- WHERE hotel_id = 'hotel-A'
+        WHERE 1=1
+    """
+    ok, reason = ast_check_hotel_id_filter(sql)
+    assert ok is False
+    # After comment-strip, hotel_id is gone from outer-WHERE
+    assert "hotel_id" in reason or "no-outer" in reason
+
+
+def test_p3_ast_validator_blocks_block_comment_filter():
+    """P3 (Gemini): hotel_id im /* ... */ Block-Comment -> BLOCK."""
+    from kmo_governance.hotel_membrane import ast_check_hotel_id_filter
+    sql = "SELECT * FROM bookings /* hotel_id='hotel-A' */ WHERE booking_date > '2026-01-01'"
+    ok, reason = ast_check_hotel_id_filter(sql)
+    assert ok is False
+
+
+def test_p3_ast_validator_passes_legitimate_with_subquery():
+    """P3: outer-WHERE hat hotel_id, Subquery zusaetzlich, OK."""
+    from kmo_governance.hotel_membrane import ast_check_hotel_id_filter
+    sql = """
+        SELECT *
+        FROM bookings
+        WHERE hotel_id = 'hotel-A'
+          AND booking_id IN (SELECT id FROM other_table)
+    """
+    ok, reason = ast_check_hotel_id_filter(sql)
+    assert ok is True
+
+
+def test_p3_blocker_ast_strict_mode_blocks_bypass():
+    """P3: CrossHotelQueryBlocker mit ast_strict=True blockt OR-bypass."""
+    from kmo_governance.hotel_membrane import CrossHotelQueryBlocker
+    blocker = CrossHotelQueryBlocker(ast_strict=True)
+    bypass_sql = "SELECT * FROM bookings WHERE hotel_id = 'X' OR 1=1"
+    import pytest
+    with pytest.raises(PermissionError) as exc:
+        blocker.check_query(bypass_sql, caller_id="some-df")
+    assert "AST-validation" in str(exc.value)
+
+
+def test_p3_blocker_ast_strict_passes_legitimate():
+    """P3: ast_strict=True laesst legitimate query durch."""
+    from kmo_governance.hotel_membrane import CrossHotelQueryBlocker
+    blocker = CrossHotelQueryBlocker(ast_strict=True)
+    legit = "SELECT * FROM bookings WHERE hotel_id = 'hotel-A'"
+    assert blocker.check_query(legit, caller_id="some-df") is True
+
+
+def test_p3_blocker_check_query_ast_diagnostic():
+    """P3: check_query_ast returns (bool, reason) without raising."""
+    from kmo_governance.hotel_membrane import CrossHotelQueryBlocker
+    blocker = CrossHotelQueryBlocker()
+    bypass = "SELECT * FROM b WHERE hotel_id='X' OR 1=1"
+    ok, reason = blocker.check_query_ast(bypass, caller_id="some-df")
+    assert ok is False
+    assert "or" in reason
+
+
+def test_p3_backwards_compat_default_strict_off():
+    """P3: ast_strict=False (Default) verhaelt sich wie vorher."""
+    from kmo_governance.hotel_membrane import CrossHotelQueryBlocker
+    blocker = CrossHotelQueryBlocker()  # default ast_strict=False
+    # OR-Bypass: regex sieht hotel_id, alter Verhalten = pass
+    sql = "SELECT * FROM b WHERE hotel_id='X' OR 1=1"
+    assert blocker.check_query(sql, caller_id="some-df") is True
