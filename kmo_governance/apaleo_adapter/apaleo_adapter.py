@@ -457,14 +457,22 @@ class ApaleoErrorHandler:
         max_retries: int = 3,
         backoff_base: float = 0.1,
         max_backoff_s: float = 30.0,
+        jitter_factor: float = 0.5,
     ) -> None:
+        """P-W9zeta-1: jitter_factor in [0.0, 1.0] (default 0.5 = +/-50%).
+
+        Anti-Thundering-Herd: ohne Jitter retryen alle Clients synchron.
+        """
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
         if backoff_base <= 0:
             raise ValueError("backoff_base must be > 0")
+        if not 0.0 <= jitter_factor <= 1.0:
+            raise ValueError("jitter_factor must be in [0.0, 1.0]")
         self.max_retries = int(max_retries)
         self.backoff_base = float(backoff_base)
         self.max_backoff_s = float(max_backoff_s)
+        self.jitter_factor = float(jitter_factor)
         # Audit: counts attempts per call
         self.last_attempt_count = 0
 
@@ -494,7 +502,16 @@ class ApaleoErrorHandler:
                 last_exc = exc
                 if attempts > retries:
                     break
-                sleep_s = min(base * (2 ** (attempts - 1)), self.max_backoff_s)
+                # P-W9zeta-1: Jitter-Backoff (Anti-Thundering-Herd)
+                base_sleep = base * (2 ** (attempts - 1))
+                if self.jitter_factor > 0.0:
+                    import random as _r
+                    jitter = _r.uniform(
+                        -self.jitter_factor * base_sleep,
+                        self.jitter_factor * base_sleep,
+                    )
+                    base_sleep = max(0.0, base_sleep + jitter)
+                sleep_s = min(base_sleep, self.max_backoff_s)
                 time.sleep(sleep_s)
         self.last_attempt_count = attempts
         if last_exc is not None:
@@ -655,6 +672,113 @@ class ApaleoBookingAdapter:
             r for r in page_data.get("items", []) if r.get("hotel_id") == hotel_id
         ]
         return self._attach_provenance(page_data)
+
+
+# ---------------------------------------------------------------------------
+# P-W9zeta-1: Circuit-Breaker (Self-Preservation-Doktrin / Bio-Pattern)
+# ---------------------------------------------------------------------------
+class CircuitBreakerOpenError(Exception):
+    """Raised wenn Circuit-Breaker offen ist (Calls werden geblockt)."""
+
+
+class ApaleoCircuitBreaker:
+    """3-State-Circuit-Breaker (Closed / Open / HalfOpen).
+
+    Bio-Aequivalent: Apoptose-Trigger nach N consecutive Fails.
+    Schuetzt vor Cascade-Failure bei Apaleo-Outage.
+
+    States:
+        - CLOSED: normaler Pass-through, Fehler werden gezaehlt.
+        - OPEN: alle Calls werden mit CircuitBreakerOpenError abgelehnt.
+        - HALF_OPEN: nach reset_timeout_s wird ein Probe-Call zugelassen.
+                     Erfolg -> CLOSED. Fehler -> OPEN (timer reset).
+
+    Pre:
+        - failure_threshold > 0
+        - reset_timeout_s > 0
+    Post:
+        - Thread-safe via internem RLock
+        - Exposes get_state() fuer Audit
+    """
+
+    STATE_CLOSED = "closed"
+    STATE_OPEN = "open"
+    STATE_HALF_OPEN = "half_open"
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        reset_timeout_s: float = 30.0,
+    ) -> None:
+        if failure_threshold <= 0:
+            raise ValueError("failure_threshold must be > 0")
+        if reset_timeout_s <= 0:
+            raise ValueError("reset_timeout_s must be > 0")
+        self.failure_threshold = int(failure_threshold)
+        self.reset_timeout_s = float(reset_timeout_s)
+        self._lock = threading.RLock()
+        self._state = self.STATE_CLOSED
+        self._failure_count = 0
+        self._opened_at: Optional[float] = None
+
+    def get_state(self) -> dict:
+        """Audit-Snapshot."""
+        with self._lock:
+            return {
+                "state": self._state,
+                "failure_count": self._failure_count,
+                "opened_at": self._opened_at,
+            }
+
+    def call(self, fn: Callable[[], Any]) -> Any:
+        """Run fn through Circuit-Breaker.
+
+        Pre: fn callable.
+        Post:
+            - if CLOSED: invoke fn; on Exception increment failure_count;
+              if >= threshold transition to OPEN.
+            - if OPEN and now < opened_at + reset_timeout: raise CircuitBreakerOpenError.
+            - if OPEN and now >= opened_at + reset_timeout: transition HALF_OPEN, probe.
+            - if HALF_OPEN: probe-call; success -> CLOSED, fail -> OPEN.
+        """
+        with self._lock:
+            if self._state == self.STATE_OPEN:
+                if self._opened_at is None:
+                    self._opened_at = time.monotonic()
+                elapsed = time.monotonic() - self._opened_at
+                if elapsed < self.reset_timeout_s:
+                    raise CircuitBreakerOpenError(
+                        f"circuit open ({elapsed:.1f}s of {self.reset_timeout_s:.1f}s)"
+                    )
+                # Transition to HALF_OPEN for probe
+                self._state = self.STATE_HALF_OPEN
+
+        # Outside lock: invoke fn
+        try:
+            result = fn()
+        except Exception:
+            with self._lock:
+                self._failure_count += 1
+                if (
+                    self._state == self.STATE_HALF_OPEN
+                    or self._failure_count >= self.failure_threshold
+                ):
+                    self._state = self.STATE_OPEN
+                    self._opened_at = time.monotonic()
+            raise
+        else:
+            with self._lock:
+                self._state = self.STATE_CLOSED
+                self._failure_count = 0
+                self._opened_at = None
+            return result
+
+    def reset(self) -> None:
+        """Manual reset (e.g. fuer Tests oder Operator-Override)."""
+        with self._lock:
+            self._state = self.STATE_CLOSED
+            self._failure_count = 0
+            self._opened_at = None
 
 
 # CRUX-MK

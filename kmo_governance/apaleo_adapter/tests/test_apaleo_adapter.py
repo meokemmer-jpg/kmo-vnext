@@ -382,3 +382,94 @@ def test_pagination_handling_returns_correct_page(
 
 
 # CRUX-MK
+
+
+# ---------------------------------------------------------------------------
+# P-W9zeta-1: Jitter-Backoff + Circuit-Breaker Tests (Welle-9zeta)
+# ---------------------------------------------------------------------------
+def test_jitter_factor_validation():
+    with pytest.raises(ValueError):
+        ApaleoErrorHandler(jitter_factor=-0.1)
+    with pytest.raises(ValueError):
+        ApaleoErrorHandler(jitter_factor=1.5)
+    h = ApaleoErrorHandler(jitter_factor=0.0)
+    assert h.jitter_factor == 0.0
+
+
+def test_jitter_factor_default_is_0_5():
+    h = ApaleoErrorHandler()
+    assert h.jitter_factor == 0.5
+
+
+def test_circuit_breaker_initial_state_is_closed():
+    from kmo_governance.apaleo_adapter.apaleo_adapter import ApaleoCircuitBreaker
+    cb = ApaleoCircuitBreaker(failure_threshold=3, reset_timeout_s=1.0)
+    state = cb.get_state()
+    assert state["state"] == "closed"
+    assert state["failure_count"] == 0
+
+
+def test_circuit_breaker_opens_after_threshold_failures():
+    from kmo_governance.apaleo_adapter.apaleo_adapter import (
+        ApaleoCircuitBreaker,
+        CircuitBreakerOpenError,
+    )
+    cb = ApaleoCircuitBreaker(failure_threshold=3, reset_timeout_s=10.0)
+
+    def fail():
+        raise RuntimeError("simulated 5xx")
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            cb.call(fail)
+
+    with pytest.raises(CircuitBreakerOpenError):
+        cb.call(fail)
+
+    state = cb.get_state()
+    assert state["state"] == "open"
+    assert state["failure_count"] >= 3
+
+
+def test_circuit_breaker_resets_after_timeout_via_probe():
+    from kmo_governance.apaleo_adapter.apaleo_adapter import ApaleoCircuitBreaker
+
+    cb = ApaleoCircuitBreaker(failure_threshold=2, reset_timeout_s=0.05)
+
+    def fail():
+        raise RuntimeError("fail")
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            cb.call(fail)
+
+    time.sleep(0.10)
+
+    def succeed():
+        return "ok"
+
+    result = cb.call(succeed)
+    assert result == "ok"
+    assert cb.get_state()["state"] == "closed"
+
+
+def test_circuit_breaker_manual_reset():
+    from kmo_governance.apaleo_adapter.apaleo_adapter import ApaleoCircuitBreaker
+
+    cb = ApaleoCircuitBreaker(failure_threshold=2, reset_timeout_s=10.0)
+
+    def fail():
+        raise RuntimeError("fail")
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            cb.call(fail)
+    assert cb.get_state()["state"] == "open"
+
+    cb.reset()
+    state = cb.get_state()
+    assert state["state"] == "closed"
+    assert state["failure_count"] == 0
+
+
+# CRUX-MK
