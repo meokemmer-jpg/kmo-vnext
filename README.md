@@ -7,15 +7,42 @@
 KMO-vNext ist eine 4-Layer-Bio-Architektur (Cell + Tissue + Organ + Organism) die organische
 Selbst-Regulations-Patterns auf Distributed-Systems-Governance uebertraegt.
 
-**Status:** Welle-9-delta Phase-4 Organism-Layer COMPLETE + Welle-9-epsilon Robustness-Härtung.
+**Status:** Welle-9 KOMPLETT-CLOSURE + Welle-9-epsilon Robustness + Soak-Tests + AST-Validator.
 
 ## Test-Stand (Welle-9 vollstaendig deployed)
 
 ```
-277 Tests passing
-21+ Module ueber 4 Layer
-Cross-LLM-2OF3-HARDENED-V2-EFFECTIVE (Codex 90.7% + Gemini 94.1%)
+305 Tests passing
+21+ Module ueber 4 Layer (Cell + Tissue + Organ + Organism)
+Cross-LLM-2OF3-HARDENED-V2-EFFECTIVE (Gemini 94.1% + Codex 90.7%)
+3OF3-V2 pending Mistral-local 3. Reviewer
 ```
+
+## Cross-LLM-Verdict-Konvergenz
+
+**V1 (vor Patches):**
+- Gemini 2.5 Pro: 82.5%
+- Codex GPT-5.4: 79.1%
+- Copilot Pro+: 80.8%
+- **Avg: 80.8% σ 1.7% → CROSS-LLM-2OF3-HARDENED**
+
+**V2 (nach F1-F7 + P3):**
+- Gemini 2.5 Pro: **94.1%**
+- Codex GPT-5.4: **90.7%**
+- Mistral-Small 3.1 24B: pending
+- **Avg: 92.4% (2 echt-V2-Reviewer)**
+
+## Welle-9-Marathon-Bilanz
+
+| Welle | Phase | Module | Tests | Cross-LLM |
+|-------|-------|--------|-------|-----------|
+| 9α | Cell | 4 | 48 | 74.34% |
+| 9β | Tissue | 3 | 30 | 77.61% |
+| 9γ | Organ | 3 | 35 | 75.71% σ<0.2% |
+| **9δ V1** | Organism | 5 | 78 | 80.8% |
+| **9δ V2** (post-Patches) | (V1 + F1-F7 + P3) | (+39+11) | **92.4%** |
+| **9ε Robustness** | Tests + Cascade + Soak | — | 13+11+5 |
+| **TOTAL** | **5 Layer** | **21+** | **305** |
 
 ## 4-Layer-Architektur
 
