@@ -212,3 +212,105 @@ def test_healthcheck_exception_treated_as_down():
     h.register("broken", broken_check)
     results = h.run_all()
     assert results["broken"] == HealthStatus.DOWN
+
+
+# ---------------------------------------------------------------------------
+# P-W11-3 V4-HIGH-2 RLock-Contention-Tests fuer observability (Welle-11)
+# ---------------------------------------------------------------------------
+def test_observability_counter_5000_concurrent_inc_no_loss():
+    """5000 inc-Calls ueber 50 threads -> exact 5000 (kein lost update)."""
+    c = Counter("stress_counter")
+    n_threads = 50
+    n_per_thread = 100
+
+    def worker():
+        for _ in range(n_per_thread):
+            c.inc()
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert c.get() == n_threads * n_per_thread
+
+
+def test_observability_gauge_concurrent_inc_dec_consistency():
+    """50 threads each inc+dec 100x -> final = 0 (race-safe)."""
+    g = Gauge("balance")
+
+    def worker():
+        for _ in range(100):
+            g.inc(1.0)
+            g.dec(1.0)
+
+    threads = [threading.Thread(target=worker) for _ in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert g.get() == 0.0
+
+
+def test_observability_histogram_concurrent_observe():
+    """1000 observations across 50 threads."""
+    h = Histogram("latency", buckets=(0.01, 0.1, 1.0))
+
+    def worker():
+        for i in range(20):
+            h.observe(0.05)  # in 0.1-bucket
+
+    threads = [threading.Thread(target=worker) for _ in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    stats = h.get_stats()
+    assert stats["count"] == 1000
+
+
+def test_observability_metrics_registry_concurrent_get_counter():
+    """10 threads je get same counter via registry -> 1 instance."""
+    reg = MetricsRegistry()
+    counters = []
+    lock = threading.Lock()
+
+    def worker():
+        c = reg.counter("shared")
+        with lock:
+            counters.append(c)
+
+    threads = [threading.Thread(target=worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # All 10 references to SAME counter (idempotency)
+    assert len(set(id(c) for c in counters)) == 1
+
+
+def test_observability_tracer_concurrent_spans_isolated():
+    """Tracer is per-thread; concurrent spans don't interfere."""
+    t = Tracer()
+    counts = {}
+    lock = threading.Lock()
+
+    def worker(name: str):
+        for _ in range(5):
+            t.start_span(name)
+            t.end_current_span()
+        spans = t.get_completed_spans()
+        with lock:
+            counts[name] = len([s for s in spans if s.name == name])
+
+    threads = [threading.Thread(target=worker, args=(f"op-{i}",)) for i in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # Total: 20 threads * 5 spans = 100 spans completed in tracer
+    spans = t.get_completed_spans()
+    assert len(spans) >= 100
