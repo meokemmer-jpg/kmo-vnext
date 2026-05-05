@@ -264,3 +264,323 @@ def test_audit_log_thread_safe_append():
 
 
 # CRUX-MK
+
+
+# ---------------------------------------------------------------------------
+# P-W10-1 Test-Density-Patch v2 (Cross-LLM-V4-CRITICAL, API-aware)
+# ---------------------------------------------------------------------------
+import threading as _t
+from kmo_governance.pre_production_canary import (
+    CanaryDeployment,
+    CanaryHealthMonitor,
+    RollbackTrigger,
+    ProgressiveRollout,
+    CanaryAuditLog,
+    CanaryOutcome,
+    RollbackDecision,
+    RolloutStep,
+    RollbackReason,
+)
+
+
+def test_canary_register_requires_baseline_first_before_route():
+    d = CanaryDeployment()
+    with pytest.raises(RuntimeError):
+        d.route_request("req-1")
+
+
+def test_canary_register_canary_traffic_zero_raises():
+    d = CanaryDeployment()
+    with pytest.raises(ValueError):
+        d.register_canary("v2", traffic_percentage=0.0)
+
+
+def test_canary_register_canary_traffic_over_100_raises():
+    d = CanaryDeployment()
+    with pytest.raises(ValueError):
+        d.register_canary("v2", traffic_percentage=101.0)
+
+
+def test_canary_register_canary_total_over_100_raises():
+    d = CanaryDeployment()
+    d.register_canary("v2", traffic_percentage=70.0)
+    with pytest.raises(ValueError):
+        d.register_canary("v3", traffic_percentage=40.0)  # total 110
+
+
+def test_canary_register_baseline_empty_raises():
+    d = CanaryDeployment()
+    with pytest.raises(ValueError):
+        d.register_baseline("")
+
+
+def test_canary_unregister_canary_idempotent():
+    d = CanaryDeployment()
+    d.register_baseline("v1")
+    d.register_canary("v2", traffic_percentage=10.0)
+    d.unregister_canary("v2")
+    d.unregister_canary("v2")  # idempotent
+
+
+def test_canary_route_distribution_5pct_within_tolerance():
+    """1000 routes, 5% canary, real distribution +/-3pct."""
+    d = CanaryDeployment()
+    d.register_baseline("v1")
+    d.register_canary("v2", traffic_percentage=5.0)
+    canary_count = sum(
+        1 for i in range(1000) if d.route_request(f"req-{i}") == "v2"
+    )
+    assert 20 <= canary_count <= 80, f"got {canary_count} canary routes"
+
+
+def test_canary_route_distribution_100pct_baseline_when_only_canary():
+    d = CanaryDeployment()
+    d.register_baseline("v1")
+    d.register_canary("v2", traffic_percentage=99.99)
+    # 1 in 10000 might still go to baseline
+    counts = {"v1": 0, "v2": 0}
+    for i in range(1000):
+        v = d.route_request(f"req-{i}")
+        counts[v] += 1
+    # Most should be canary
+    assert counts["v2"] > 950
+
+
+def test_canary_route_deterministic():
+    d = CanaryDeployment()
+    d.register_baseline("v1")
+    d.register_canary("v2", traffic_percentage=50.0)
+    # Same request_id always -> same version
+    for _ in range(20):
+        assert d.route_request("req-X") == d.route_request("req-X")
+
+
+def test_canary_get_distribution_includes_baseline():
+    d = CanaryDeployment()
+    d.register_baseline("v1")
+    d.register_canary("v2", traffic_percentage=20.0)
+    dist = d.get_distribution()
+    assert dist.get("v1") == 80.0
+    assert dist.get("v2") == 20.0
+
+
+def test_canary_health_monitor_window_capacity_validation():
+    with pytest.raises(ValueError):
+        CanaryHealthMonitor(window_capacity=0)
+    with pytest.raises(ValueError):
+        CanaryHealthMonitor(window_capacity=-10)
+
+
+def test_canary_health_monitor_record_outcome_negative_latency_raises():
+    hm = CanaryHealthMonitor()
+    with pytest.raises(ValueError):
+        hm.record_outcome("v2", success=True, latency_ms=-1.0)
+
+
+def test_canary_health_monitor_unknown_version_returns_zero():
+    hm = CanaryHealthMonitor()
+    assert hm.get_error_rate("nonexistent") == 0.0
+    assert hm.get_p99_latency("nonexistent") == 0.0
+
+
+def test_canary_health_monitor_all_failures_100pct():
+    hm = CanaryHealthMonitor()
+    for _ in range(20):
+        hm.record_outcome("v2", success=False, latency_ms=10.0)
+    assert hm.get_error_rate("v2") == 1.0
+
+
+def test_canary_health_monitor_all_success_zero_error():
+    hm = CanaryHealthMonitor()
+    for _ in range(20):
+        hm.record_outcome("v2", success=True, latency_ms=10.0)
+    assert hm.get_error_rate("v2") == 0.0
+
+
+def test_canary_health_monitor_p99_latency():
+    hm = CanaryHealthMonitor()
+    for i in range(100):
+        hm.record_outcome("v2", success=True, latency_ms=float(i))
+    p99 = hm.get_p99_latency("v2")
+    # P99 of [0..99] is ~99
+    assert 95.0 <= p99 <= 99.0
+
+
+def test_canary_health_monitor_window_overflow_drops_oldest():
+    hm = CanaryHealthMonitor(window_capacity=10)
+    for _ in range(20):
+        hm.record_outcome("v2", success=False, latency_ms=1.0)
+    # Window only contains last 10
+    assert hm.sample_count("v2") <= 10
+
+
+def test_canary_rollback_trigger_no_monitor_raises():
+    rt = RollbackTrigger()
+    with pytest.raises(RuntimeError):
+        rt.check_rollback_needed("v2")
+
+
+def test_canary_rollback_trigger_insufficient_samples_no_fire():
+    hm = CanaryHealthMonitor()
+    rt = RollbackTrigger(min_samples=10)
+    rt.register_canary_monitor(hm)
+    for _ in range(5):  # only 5 samples
+        hm.record_outcome("v2", success=False, latency_ms=10.0)
+    decision = rt.check_rollback_needed("v2")
+    assert not decision.rollback
+
+
+def test_canary_rollback_trigger_high_error_rate_fires():
+    hm = CanaryHealthMonitor()
+    rt = RollbackTrigger(error_threshold=0.05, min_samples=10)
+    rt.register_canary_monitor(hm)
+    for _ in range(20):
+        hm.record_outcome("v2", success=False, latency_ms=10.0)
+    decision = rt.check_rollback_needed("v2")
+    assert decision.rollback
+    assert decision.reason == RollbackReason.ERROR_RATE_EXCEEDED
+
+
+def test_canary_rollback_trigger_high_latency_fires():
+    hm = CanaryHealthMonitor()
+    rt = RollbackTrigger(latency_threshold_ms=100.0, min_samples=10, error_threshold=0.99)
+    rt.register_canary_monitor(hm)
+    for _ in range(20):
+        hm.record_outcome("v2", success=True, latency_ms=200.0)
+    decision = rt.check_rollback_needed("v2")
+    assert decision.rollback
+    assert decision.reason == RollbackReason.LATENCY_REGRESSION
+
+
+def test_canary_rollback_trigger_manual_override_fires():
+    hm = CanaryHealthMonitor()
+    rt = RollbackTrigger(min_samples=1)
+    rt.register_canary_monitor(hm)
+    rt.trigger_manual_override("v2", reason="testing")
+    decision = rt.check_rollback_needed("v2")
+    assert decision.rollback
+    assert decision.reason == RollbackReason.MANUAL_OVERRIDE
+
+
+def test_canary_rollback_trigger_cooldown_blocks_repeat():
+    hm = CanaryHealthMonitor()
+    rt = RollbackTrigger(error_threshold=0.05, min_samples=10, cooldown_s=60.0)
+    rt.register_canary_monitor(hm)
+    for _ in range(20):
+        hm.record_outcome("v2", success=False, latency_ms=10.0)
+    rt.check_rollback_needed("v2")  # first fire
+    # Second check within cooldown -> no fire
+    decision = rt.check_rollback_needed("v2")
+    assert not decision.rollback
+
+
+def test_progressive_rollout_empty_schedule_raises():
+    with pytest.raises(ValueError):
+        ProgressiveRollout(
+            canary_version_id="v2",
+            baseline_version_id="v1",
+            schedule=[],
+        )
+
+
+def test_progressive_rollout_advance_returns_step():
+    d = CanaryDeployment()
+    d.register_baseline("v1")
+    schedule = [RolloutStep(time_s=0.0, percentage=10.0)]
+    pr = ProgressiveRollout(
+        canary_version_id="v2",
+        baseline_version_id="v1",
+        schedule=schedule,
+        deployment=d,
+    )
+    step = pr.advance()
+    assert step is not None
+    assert step.percentage == 10.0
+
+
+def test_progressive_rollout_complete_after_all_steps():
+    d = CanaryDeployment()
+    d.register_baseline("v1")
+    schedule = [
+        RolloutStep(time_s=0.0, percentage=10.0),
+        RolloutStep(time_s=0.0, percentage=50.0),
+        RolloutStep(time_s=0.0, percentage=100.0),
+    ]
+    pr = ProgressiveRollout(
+        canary_version_id="v2",
+        baseline_version_id="v1",
+        schedule=schedule,
+        deployment=d,
+    )
+    while not pr.is_complete():
+        pr.advance()
+    assert pr.is_complete()
+
+
+def test_progressive_rollout_rollback_marks_complete():
+    d = CanaryDeployment()
+    d.register_baseline("v1")
+    schedule = [RolloutStep(time_s=0.0, percentage=10.0)]
+    pr = ProgressiveRollout(
+        canary_version_id="v2",
+        baseline_version_id="v1",
+        schedule=schedule,
+        deployment=d,
+    )
+    pr.rollback_to_baseline()
+    assert pr.is_complete()
+
+
+def test_canary_audit_log_records_decisions():
+    al = CanaryAuditLog()
+    al.log_decision(
+        version_id="v2",
+        action="ROLLBACK",
+        reason="error_rate",
+        ts=12345.0,
+    )
+    history = al.get_history()
+    assert len(history) == 1
+    assert history[0].version_id == "v2"
+
+
+def test_canary_audit_log_concurrent_50_threads():
+    al = CanaryAuditLog()
+
+    def worker(n: int):
+        al.log_decision(
+            version_id=f"v{n}",
+            action="TEST",
+            reason=f"reason-{n}",
+            ts=float(n),
+        )
+
+    threads = [_t.Thread(target=worker, args=(i,)) for i in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(al) == 50
+
+
+def test_canary_outcome_frozen_dataclass():
+    o = CanaryOutcome(
+        version_id="v2",
+        success=True,
+        latency_ms=10.0,
+        ts=1234.0,
+    )
+    with pytest.raises(Exception):
+        o.success = False
+
+
+def test_rollback_decision_frozen():
+    rd = RollbackDecision(
+        rollback=True,
+        reason=RollbackReason.ERROR_RATE_EXCEEDED,
+        affected_version="v2",
+        detail="test",
+    )
+    with pytest.raises(Exception):
+        rd.rollback = False
