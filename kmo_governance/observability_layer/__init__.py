@@ -15,7 +15,9 @@ from .observability_layer import (
     Histogram,
     HealthCheckRegistry,
     HealthStatus,
+    LockStripedMetricsRegistry,
     MetricsRegistry,
+    PrometheusComplianceValidator,
     Span,
     Tracer,
 )
@@ -26,7 +28,9 @@ __all__ = [
     "Histogram",
     "HealthCheckRegistry",
     "HealthStatus",
+    "LockStripedMetricsRegistry",
     "MetricsRegistry",
+    "PrometheusComplianceValidator",
     "Span",
     "Tracer",
 ]

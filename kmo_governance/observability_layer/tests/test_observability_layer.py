@@ -314,3 +314,137 @@ def test_observability_tracer_concurrent_spans_isolated():
     # Total: 20 threads * 5 spans = 100 spans completed in tracer
     spans = t.get_completed_spans()
     assert len(spans) >= 100
+
+
+# ---------------------------------------------------------------------------
+# Welle-12 P-W12-1 V5-HIGH-1 Lock-Striping Tests
+# ---------------------------------------------------------------------------
+def test_lock_striped_registry_init_validation():
+    from kmo_governance.observability_layer import LockStripedMetricsRegistry
+    with pytest.raises(ValueError):
+        LockStripedMetricsRegistry(n_buckets=0)
+    with pytest.raises(ValueError):
+        LockStripedMetricsRegistry(n_buckets=-1)
+
+
+def test_lock_striped_registry_idempotent_counter():
+    from kmo_governance.observability_layer import LockStripedMetricsRegistry
+    reg = LockStripedMetricsRegistry(n_buckets=8)
+    c1 = reg.counter("foo")
+    c2 = reg.counter("foo")
+    assert c1 is c2
+
+
+def test_lock_striped_registry_distributes_buckets():
+    from kmo_governance.observability_layer import LockStripedMetricsRegistry
+    reg = LockStripedMetricsRegistry(n_buckets=8)
+    for i in range(100):
+        reg.counter(f"metric_{i}")
+    load = reg.get_bucket_load()
+    # Property: at least 4 buckets used (statistical, no perfect skew)
+    assert sum(1 for n in load if n > 0) >= 4
+
+
+def test_lock_striped_registry_concurrent_50_threads():
+    from kmo_governance.observability_layer import LockStripedMetricsRegistry
+    reg = LockStripedMetricsRegistry(n_buckets=16)
+
+    def worker(n: int):
+        c = reg.counter(f"shared_{n % 5}")  # 5 distinct names, all threads contend
+        for _ in range(50):
+            c.inc()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Total: 50 threads * 50 inc = 2500. Distributed across 5 counters.
+    total = sum(reg.counter(f"shared_{i}").get() for i in range(5))
+    assert total == 2500
+
+
+def test_lock_striped_registry_gauge_and_histogram():
+    from kmo_governance.observability_layer import LockStripedMetricsRegistry
+    reg = LockStripedMetricsRegistry(n_buckets=4)
+    g = reg.gauge("memory")
+    g.set(100.0)
+    assert reg.gauge("memory").get() == 100.0
+
+    h = reg.histogram("latency")
+    h.observe(0.1)
+    assert reg.histogram("latency").get_stats()["count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Welle-12 P-W12-2 V5-HIGH-2 Prometheus-Compliance Tests
+# ---------------------------------------------------------------------------
+def test_prometheus_metric_name_valid():
+    from kmo_governance.observability_layer import PrometheusComplianceValidator
+    ok, _ = PrometheusComplianceValidator.validate_metric_name("requests_total")
+    assert ok
+
+
+def test_prometheus_metric_name_starts_with_digit_invalid():
+    from kmo_governance.observability_layer import PrometheusComplianceValidator
+    ok, _ = PrometheusComplianceValidator.validate_metric_name("123foo")
+    assert not ok
+
+
+def test_prometheus_metric_name_with_dash_invalid():
+    from kmo_governance.observability_layer import PrometheusComplianceValidator
+    ok, _ = PrometheusComplianceValidator.validate_metric_name("foo-bar")
+    assert not ok
+
+
+def test_prometheus_metric_name_empty_invalid():
+    from kmo_governance.observability_layer import PrometheusComplianceValidator
+    ok, _ = PrometheusComplianceValidator.validate_metric_name("")
+    assert not ok
+
+
+def test_prometheus_label_name_valid():
+    from kmo_governance.observability_layer import PrometheusComplianceValidator
+    ok, _ = PrometheusComplianceValidator.validate_label_name("method")
+    assert ok
+
+
+def test_prometheus_label_double_underscore_reserved():
+    from kmo_governance.observability_layer import PrometheusComplianceValidator
+    ok, _ = PrometheusComplianceValidator.validate_label_name("__name__")
+    assert not ok
+
+
+def test_prometheus_label_internal_double_underscore_reserved():
+    from kmo_governance.observability_layer import PrometheusComplianceValidator
+    ok, _ = PrometheusComplianceValidator.validate_label_name("__internal")
+    assert not ok
+
+
+def test_prometheus_cardinality_warn_at_threshold():
+    from kmo_governance.observability_layer import PrometheusComplianceValidator
+    labels_seen = [{"k": str(i)} for i in range(2000)]
+    ok, msg = PrometheusComplianceValidator.check_cardinality(labels_seen, warn_at=1000)
+    assert not ok
+    assert "cardinality" in msg
+
+
+def test_prometheus_validate_full_metric_passes():
+    from kmo_governance.observability_layer import PrometheusComplianceValidator
+    result = PrometheusComplianceValidator.validate_full_metric(
+        "requests_total",
+        labels={"method": "GET", "status": "200"},
+    )
+    assert result["valid"]
+    assert len(result["violations"]) == 0
+
+
+def test_prometheus_validate_full_metric_fails_on_bad_label():
+    from kmo_governance.observability_layer import PrometheusComplianceValidator
+    result = PrometheusComplianceValidator.validate_full_metric(
+        "requests_total",
+        labels={"__name__": "evil"},
+    )
+    assert not result["valid"]
+    assert len(result["violations"]) >= 1

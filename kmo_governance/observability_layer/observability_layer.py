@@ -298,4 +298,161 @@ class HealthCheckRegistry:
         return HealthStatus.UP
 
 
+# ---------------------------------------------------------------------------
+# Welle-12 P-W12-1 V5-HIGH-1 Lock-Striping (Cross-LLM-V5-Finding H1 Closure)
+# ---------------------------------------------------------------------------
+class LockStripedMetricsRegistry:
+    """Lock-Striped MetricsRegistry fuer hohe-Concurrency-Last.
+
+    Statt single RLock fuer alle Metrics: hash-basiertes Routing zu n Buckets
+    mit je einem dedizierten RLock. Reduziert Contention bei parallel
+    Counter/Gauge/Histogram Lookups.
+
+    Pre: n_buckets > 0
+    Post: thread-safe + reduced contention; each metric_name -> deterministic bucket
+
+    Example:
+        reg = LockStripedMetricsRegistry(n_buckets=16)
+        c1 = reg.counter("requests_total")  # bucket = hash("requests_total") % 16
+        c2 = reg.counter("requests_total")  # same bucket, idempotent (same instance)
+    """
+
+    def __init__(self, n_buckets: int = 16) -> None:
+        if n_buckets <= 0:
+            raise ValueError("n_buckets must be > 0")
+        self.n_buckets = int(n_buckets)
+        self._counters: list[dict[str, Counter]] = [
+            {} for _ in range(self.n_buckets)
+        ]
+        self._gauges: list[dict[str, Gauge]] = [
+            {} for _ in range(self.n_buckets)
+        ]
+        self._histograms: list[dict[str, Histogram]] = [
+            {} for _ in range(self.n_buckets)
+        ]
+        self._locks: list[threading.Lock] = [
+            threading.Lock() for _ in range(self.n_buckets)
+        ]
+
+    def _bucket_for(self, name: str) -> int:
+        """Stable hash -> bucket-index in [0, n_buckets)."""
+        # Use built-in hash, mask to positive
+        h = hash(name) & 0x7FFFFFFF
+        return h % self.n_buckets
+
+    def counter(self, name: str, labels: Optional[dict] = None) -> Counter:
+        """Get or create Counter (lock-striped)."""
+        b = self._bucket_for(name)
+        key = f"{name}:{sorted((labels or {}).items())}"
+        with self._locks[b]:
+            if key not in self._counters[b]:
+                self._counters[b][key] = Counter(name, labels)
+            return self._counters[b][key]
+
+    def gauge(self, name: str, labels: Optional[dict] = None) -> Gauge:
+        b = self._bucket_for(name)
+        key = f"{name}:{sorted((labels or {}).items())}"
+        with self._locks[b]:
+            if key not in self._gauges[b]:
+                self._gauges[b][key] = Gauge(name, labels)
+            return self._gauges[b][key]
+
+    def histogram(self, name: str, buckets: Optional[tuple] = None) -> Histogram:
+        b = self._bucket_for(name)
+        with self._locks[b]:
+            if name not in self._histograms[b]:
+                self._histograms[b][name] = Histogram(name, buckets)
+            return self._histograms[b][name]
+
+    def get_bucket_load(self) -> list[int]:
+        """Audit: count of metrics per bucket (for skew-detection)."""
+        result = []
+        for i in range(self.n_buckets):
+            with self._locks[i]:
+                count = (
+                    len(self._counters[i])
+                    + len(self._gauges[i])
+                    + len(self._histograms[i])
+                )
+                result.append(count)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Welle-12 P-W12-2 V5-HIGH-2 Prometheus-Compliance (H2 Closure)
+# ---------------------------------------------------------------------------
+class PrometheusComplianceValidator:
+    """Validator fuer Prometheus-Naming-Conventions + Cardinality-Limits.
+
+    Spec-Referenz: https://prometheus.io/docs/practices/naming/
+    - Metric-Names: [a-zA-Z_:][a-zA-Z0-9_:]*
+    - Suffixes: _total, _count, _sum, _bucket
+    - No 'le' label on non-histogram
+    - Cardinality-Limit: warn at >1000 unique label-combinations
+    """
+
+    METRIC_NAME_PATTERN = r"^[a-zA-Z_:][a-zA-Z0-9_:]*$"
+    LABEL_NAME_PATTERN = r"^[a-zA-Z_][a-zA-Z0-9_]*$"
+    RESERVED_LABEL_NAMES = {"__name__"}
+    HISTOGRAM_RESERVED_LABEL = "le"
+    DEFAULT_CARDINALITY_WARN = 1000
+
+    @staticmethod
+    def validate_metric_name(name: str) -> tuple[bool, str]:
+        import re
+        if not name:
+            return False, "metric name must be non-empty"
+        if not re.match(PrometheusComplianceValidator.METRIC_NAME_PATTERN, name):
+            return False, f"metric name {name!r} violates pattern"
+        return True, "ok"
+
+    @staticmethod
+    def validate_label_name(name: str) -> tuple[bool, str]:
+        import re
+        if not name:
+            return False, "label name must be non-empty"
+        if name in PrometheusComplianceValidator.RESERVED_LABEL_NAMES:
+            return False, f"reserved label-name: {name}"
+        if name.startswith("__"):
+            return False, f"label-names with __ prefix reserved: {name}"
+        if not re.match(PrometheusComplianceValidator.LABEL_NAME_PATTERN, name):
+            return False, f"label name {name!r} violates pattern"
+        return True, "ok"
+
+    @staticmethod
+    def check_cardinality(
+        labels_seen: list[dict[str, str]],
+        warn_at: int = DEFAULT_CARDINALITY_WARN,
+    ) -> tuple[bool, str]:
+        unique = set()
+        for labels in labels_seen:
+            unique.add(tuple(sorted(labels.items())))
+        if len(unique) > warn_at:
+            return False, f"cardinality {len(unique)} exceeds {warn_at}"
+        return True, f"ok ({len(unique)} unique combinations)"
+
+    @staticmethod
+    def validate_full_metric(
+        name: str,
+        labels: Optional[dict[str, str]] = None,
+    ) -> dict:
+        """Comprehensive validation. Returns dict with violations + ok-status."""
+        violations = []
+        name_ok, name_msg = PrometheusComplianceValidator.validate_metric_name(name)
+        if not name_ok:
+            violations.append({"field": "name", "issue": name_msg})
+        if labels:
+            for label_name in labels:
+                lbl_ok, lbl_msg = PrometheusComplianceValidator.validate_label_name(
+                    label_name
+                )
+                if not lbl_ok:
+                    violations.append({"field": label_name, "issue": lbl_msg})
+        return {
+            "valid": len(violations) == 0,
+            "violations": violations,
+            "name": name,
+        }
+
+
 # CRUX-MK
