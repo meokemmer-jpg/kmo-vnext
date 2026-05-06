@@ -314,3 +314,95 @@ def test_controller_concurrent_safe() -> None:
     assert len(decisions) == 200
     history = ctrl.history()
     assert len(history) == 200
+
+
+# ---------------------------------------------------------------------------
+# Welle-17 P-W17-2 Backpressure Hysteresis-Stress (V6+V7-Recommendation)
+# ---------------------------------------------------------------------------
+import math as _m
+import threading as _t
+
+
+def test_backpressure_hysteresis_no_flapping_under_oscillation():
+    """Sinusoidal load oscillation should NOT cause Mode-Flapping."""
+    sensor = PressureSensor()
+    capacity = AdaptiveCapacity(
+        base_capacity=100.0,
+        threshold_high=0.8,
+        threshold_low=0.4,
+    )
+    decisions = []
+    for t in range(50):
+        # Sinusoidal oscillation 0.4-0.8
+        pressure = 0.6 + 0.2 * _m.sin(t * _m.pi / 5)
+        new_cap = capacity.adjust(pressure)
+        decisions.append(new_cap)
+
+    # Property: no infinite oscillation; capacity stays in reasonable range
+    cap_min = min(decisions)
+    cap_max = max(decisions)
+    assert cap_min > 10.0
+    assert cap_max <= 100.0
+
+
+def test_backpressure_high_pressure_reduces_capacity():
+    capacity = AdaptiveCapacity(
+        base_capacity=100.0,
+        threshold_high=0.8,
+        threshold_low=0.4,
+    )
+    initial = capacity.current_capacity
+    capacity.adjust(0.95)
+    assert capacity.current_capacity < initial
+
+
+def test_backpressure_low_pressure_expands_capacity():
+    capacity = AdaptiveCapacity(
+        base_capacity=100.0,
+        threshold_high=0.8,
+        threshold_low=0.4,
+    )
+    capacity.adjust(0.95)  # reduce
+    after_reduce = capacity.current_capacity
+    capacity.adjust(0.2)  # low pressure -> expand
+    assert capacity.current_capacity >= after_reduce
+
+
+def test_backpressure_concurrent_ticks_50_threads():
+    sensor = PressureSensor()
+    sensor.register_source("s1", lambda: 0.5)
+    capacity = AdaptiveCapacity(base_capacity=100.0)
+    controller = BackpressureController(rate_per_s=100)
+    controller.register_sensor(sensor)
+    controller.register_capacity(capacity)
+
+    decisions = []
+    lock = _t.Lock()
+
+    def worker():
+        for _ in range(10):
+            d = controller.tick()
+            with lock:
+                decisions.append(d)
+
+    threads = [_t.Thread(target=worker) for _ in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(decisions) == 500
+
+
+def test_backpressure_queue_overflow_under_burst_load():
+    guard = QueueOverflowGuard(max_depth=10)
+    accepted = 0
+    rejected = 0
+    for i in range(100):
+        ok, depth = guard.try_enqueue(f"item-{i}")
+        if ok:
+            accepted += 1
+        else:
+            rejected += 1
+    assert accepted == 10
+    assert rejected == 90

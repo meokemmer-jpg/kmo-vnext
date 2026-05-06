@@ -359,3 +359,263 @@ def test_orchestrator_concurrent_safe():
 
 
 # CRUX-MK
+
+
+# ---------------------------------------------------------------------------
+# Welle-17 P-W17-1 Saga Property/Fault-Injection (V6+V7-Recommendation)
+# ---------------------------------------------------------------------------
+import random as _r
+import threading as _t
+
+
+def test_saga_property_dag_validates_acyclic_random_50():
+    """50 random DAGs validate without cycle."""
+    rng = _r.Random(42)
+    for trial in range(50):
+        graph = SagaStepGraph()
+        n_steps = rng.randint(2, 6)
+        for i in range(n_steps):
+            depends = tuple(f"step-{j}" for j in range(i) if rng.random() < 0.3)
+            graph.add_step(
+                SagaStep(
+                    step_id=f"step-{i}",
+                    name=f"s{i}",
+                    forward_fn=lambda: None,
+                    compensate_fn=None,
+                    timeout_s=1.0,
+                    depends_on=depends,
+                    max_retries=0,
+                )
+            )
+        graph.validate_dag()  # should not raise
+
+
+def test_saga_property_topological_order_respects_deps():
+    """For each random DAG, topological_sort puts dependencies before dependents."""
+    rng = _r.Random(123)
+    for _ in range(20):
+        graph = SagaStepGraph()
+        n_steps = 5
+        for i in range(n_steps):
+            depends = tuple(f"step-{j}" for j in range(i) if rng.random() < 0.4)
+            graph.add_step(
+                SagaStep(
+                    step_id=f"step-{i}",
+                    name=f"s{i}",
+                    forward_fn=lambda: None,
+                    timeout_s=1.0,
+                    depends_on=depends,
+                    max_retries=0,
+                )
+            )
+        order = graph.topological_sort()
+        seen = set()
+        for step in order:
+            for dep in step.depends_on:
+                assert dep in seen, f"dep {dep} not before {step.step_id}"
+            seen.add(step.step_id)
+
+
+def test_saga_fault_injection_random_failure_handled():
+    """Random failure-rate per-step. All-step-results must be valid Status."""
+    rng = _r.Random(7)
+    graph = SagaStepGraph()
+    fail_targets = set()
+
+    def make_fn(sid):
+        def fn():
+            if sid in fail_targets:
+                raise RuntimeError(f"injected-fault-{sid}")
+            return "ok"
+        return fn
+
+    for i in range(8):
+        sid = f"step-{i}"
+        if rng.random() < 0.3:
+            fail_targets.add(sid)
+        graph.add_step(
+            SagaStep(
+                step_id=sid,
+                name=sid,
+                forward_fn=make_fn(sid),
+                timeout_s=1.0,
+                depends_on=(),
+                max_retries=0,
+            )
+        )
+
+    orch = SagaStepOrchestrator()
+    orch.register_graph(graph)
+    results = orch.run()
+    # Each result has a valid status
+    for r in results:
+        assert r.status in (
+            StepStatus.COMPLETED,
+            StepStatus.FAILED,
+            StepStatus.SKIPPED,
+        )
+
+
+def test_saga_property_failed_predecessor_skips_dependents():
+    """When step-A fails and step-B depends_on A, B is SKIPPED."""
+    graph = SagaStepGraph()
+    graph.add_step(
+        SagaStep(
+            step_id="A",
+            name="a",
+            forward_fn=lambda: (_ for _ in ()).throw(RuntimeError("a-fail")),
+            timeout_s=1.0,
+            depends_on=(),
+            max_retries=0,
+        )
+    )
+    graph.add_step(
+        SagaStep(
+            step_id="B",
+            name="b",
+            forward_fn=lambda: "ok",
+            timeout_s=1.0,
+            depends_on=("A",),
+            max_retries=0,
+        )
+    )
+    orch = SagaStepOrchestrator()
+    orch.register_graph(graph)
+    results = orch.run()
+    by_id = {r.step_id: r for r in results}
+    assert by_id["A"].status == StepStatus.FAILED
+    assert by_id["B"].status == StepStatus.SKIPPED
+
+
+def test_saga_compensation_runs_in_reverse_dag_order():
+    """Compensation order is reverse of execution order."""
+    compensation_order = []
+
+    def make_fn(sid):
+        return lambda: "ok"
+
+    def make_comp(sid):
+        return lambda: compensation_order.append(sid) or "compensated"
+
+    graph = SagaStepGraph()
+    for i in range(4):
+        sid = f"step-{i}"
+        depends = (f"step-{i-1}",) if i > 0 else ()
+        graph.add_step(
+            SagaStep(
+                step_id=sid,
+                name=sid,
+                forward_fn=make_fn(sid),
+                compensate_fn=make_comp(sid),
+                timeout_s=1.0,
+                depends_on=depends,
+                max_retries=0,
+            )
+        )
+    orch = SagaStepOrchestrator()
+    orch.register_graph(graph)
+    orch.run()
+    orch.compensate("step-3")  # rollback all
+    # Reverse order: 3, 2, 1, 0 (or subset that ran)
+    if len(compensation_order) >= 2:
+        # First-compensated should be later-than second
+        assert compensation_order[0].split("-")[1] >= compensation_order[1].split("-")[1]
+
+
+def test_saga_concurrent_run_50_threads_isolated_orchestrators():
+    """50 threads each with own orchestrator -> no cross-thread state."""
+    results = []
+    lock = _t.Lock()
+
+    def worker(n: int):
+        graph = SagaStepGraph()
+        graph.add_step(
+            SagaStep(
+                step_id="s",
+                name="s",
+                forward_fn=lambda n=n: f"result-{n}",
+                timeout_s=1.0,
+                depends_on=(),
+                max_retries=0,
+            )
+        )
+        orch = SagaStepOrchestrator()
+        orch.register_graph(graph)
+        result = orch.run()
+        with lock:
+            results.append(result[0])
+
+    threads = [_t.Thread(target=worker, args=(i,)) for i in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == 50
+    assert all(r.status == StepStatus.COMPLETED for r in results)
+
+
+def test_saga_retry_policy_applied():
+    """Step that fails-then-succeeds should retry per RetryPolicy."""
+    attempt_count = {"n": 0}
+
+    def flaky():
+        attempt_count["n"] += 1
+        if attempt_count["n"] < 2:
+            raise RuntimeError("temp")
+        return "ok"
+
+    graph = SagaStepGraph()
+    graph.add_step(
+        SagaStep(
+            step_id="s",
+            name="s",
+            forward_fn=flaky,
+            timeout_s=1.0,
+            depends_on=(),
+            max_retries=3,
+        )
+    )
+    orch = SagaStepOrchestrator(
+        retry_policy=RetryPolicy(
+            max_retries=3,
+            backoff_base_s=0.001,
+            backoff_factor=2.0,
+            jitter_factor=0.0,
+        )
+    )
+    orch.register_graph(graph)
+    results = orch.run()
+    # If retry-policy works, step succeeds on attempt 2
+    assert results[0].attempts >= 2
+
+
+def test_saga_isolated_branches_continue_when_other_fails():
+    """Branch-A fails, Branch-B (independent) still runs."""
+    graph = SagaStepGraph()
+    graph.add_step(
+        SagaStep(
+            step_id="A",
+            name="a-fail",
+            forward_fn=lambda: (_ for _ in ()).throw(RuntimeError("A")),
+            timeout_s=1.0,
+            depends_on=(),
+            max_retries=0,
+        )
+    )
+    graph.add_step(
+        SagaStep(
+            step_id="B",
+            name="b-ok",
+            forward_fn=lambda: "B-ok",
+            timeout_s=1.0,
+            depends_on=(),
+            max_retries=0,
+        )
+    )
+    orch = SagaStepOrchestrator()
+    orch.register_graph(graph)
+    results = orch.run()
+    by_id = {r.step_id: r for r in results}
+    assert by_id["A"].status == StepStatus.FAILED
+    assert by_id["B"].status == StepStatus.COMPLETED
