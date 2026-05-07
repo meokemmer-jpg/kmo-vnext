@@ -11,7 +11,7 @@ import hashlib
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 
@@ -51,13 +51,24 @@ class EventRecord:
     """Frozen interner Datensatz pro getrackt'em Event.
 
     Pre: event_hash non-empty, first_seen_at > 0, ttl_s > 0, hit_count >= 0.
+         last_access_at default = first_seen_at, must be >= first_seen_at.
     Post: immutable. Updates erzeugen neuen EventRecord.
+
+    Felder:
+      - event_hash: SHA256-Hash des Events.
+      - first_seen_at: Erstmaliges Auftreten (TTL-Anker, unveraendert).
+      - hit_count: Anzahl bisheriger Duplikat-Hits.
+      - ttl_s: TTL-Dauer in Sekunden (Anker fuer Expiry).
+      - last_access_at: Zeitpunkt des letzten Zugriffs (Hit oder first_seen).
+                        Wird bei jedem Hit aktualisiert. Steuert True-LRU-Eviction
+                        (eldest-by-last_access). Default = first_seen_at.
     """
 
     event_hash: str
     first_seen_at: float
     hit_count: int
     ttl_s: float
+    last_access_at: float = field(default=-1.0)
 
     def __post_init__(self) -> None:
         if not self.event_hash:
@@ -68,6 +79,12 @@ class EventRecord:
             raise ValueError("ttl_s must be > 0")
         if self.hit_count < 0:
             raise ValueError("hit_count must be >= 0")
+        # Backward-compatible default: if last_access_at not provided (-1.0 sentinel),
+        # set it to first_seen_at via object.__setattr__ (frozen dataclass workaround).
+        if self.last_access_at == -1.0:
+            object.__setattr__(self, "last_access_at", self.first_seen_at)
+        elif self.last_access_at < self.first_seen_at:
+            raise ValueError("last_access_at must be >= first_seen_at")
 
     def is_expired(self, now: float) -> bool:
         return (now - self.first_seen_at) >= self.ttl_s
@@ -147,12 +164,14 @@ class DeduplicationEngine:
             existing = self._records.get(event_hash)
             if existing is not None:
                 if not existing.is_expired(now):
-                    # Active duplicate: bump hit_count, keep first_seen_at.
+                    # Active duplicate: bump hit_count, keep first_seen_at,
+                    # update last_access_at for True-LRU.
                     updated = EventRecord(
                         event_hash=existing.event_hash,
                         first_seen_at=existing.first_seen_at,
                         hit_count=existing.hit_count + 1,
                         ttl_s=existing.ttl_s,
+                        last_access_at=now,
                     )
                     self._records[event_hash] = updated
                     self._hits += 1
@@ -173,6 +192,7 @@ class DeduplicationEngine:
                     first_seen_at=now,
                     hit_count=0,
                     ttl_s=effective_ttl,
+                    last_access_at=now,
                 )
                 self._misses += 1
                 return DedupResult(
@@ -191,6 +211,7 @@ class DeduplicationEngine:
                 first_seen_at=now,
                 hit_count=0,
                 ttl_s=effective_ttl,
+                last_access_at=now,
             )
             self._misses += 1
             return DedupResult(
@@ -203,11 +224,19 @@ class DeduplicationEngine:
             )
 
     def _evict_if_needed(self) -> None:
-        """LRU-Eviction by first_seen_at (eldest first). Lock held by caller."""
+        """True-LRU-Eviction by last_access_at (eldest-by-last_access first).
+
+        Pre: lock held by caller.
+        Post: hot duplicate records (recently accessed) are protected from
+              eviction; truly idle records are evicted first.
+
+        W20-P2 Fix (Cross-LLM-V10 Codex): vorher FIFO-by-first_seen, jetzt
+        True-LRU-by-last_access.
+        """
         while len(self._records) >= self.max_entries:
             eldest_hash = min(
                 self._records,
-                key=lambda h: self._records[h].first_seen_at,
+                key=lambda h: self._records[h].last_access_at,
             )
             del self._records[eldest_hash]
             self._evictions += 1

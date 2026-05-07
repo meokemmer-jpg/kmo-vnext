@@ -300,3 +300,153 @@ def test_event_record_validation():
     assert rec.is_expired(now=130.0) is False
     assert rec.remaining_s(now=130.0) == pytest.approx(30.0, abs=0.001)
     assert rec.remaining_s(now=200.0) == 0.0
+
+
+# --- W20-P2: True-LRU Eviction Tests (Welle-20 Patch-1) ---
+
+
+def test_lru_eviction_uses_last_access_not_first_seen():
+    """True-LRU by last_access_at (NOT FIFO by first_seen_at).
+
+    W20-P2 (Cross-LLM-V10 Codex): hot records survive eviction.
+    Hot record (id=1, accessed 5 times, latest access very recent) must NOT be
+    evicted when a new record arrives, even though its first_seen_at is oldest.
+    """
+    engine = DeduplicationEngine(default_ttl_s=3600.0, max_entries=3)
+    # Create 3 records, id=1 has earliest first_seen_at
+    engine.check({"id": 1})
+    time.sleep(0.001)
+    engine.check({"id": 2})
+    time.sleep(0.001)
+    engine.check({"id": 3})
+    # Access id=1 multiple times -> last_access_at becomes recent
+    time.sleep(0.001)
+    engine.check({"id": 1})
+    time.sleep(0.001)
+    engine.check({"id": 1})
+    time.sleep(0.001)
+    # Now id=2 has the OLDEST last_access_at (was only touched at first_seen)
+    # Insert id=4 -> should evict id=2 (LRU), NOT id=1 (despite older first_seen_at)
+    engine.check({"id": 4})
+    stats = engine.get_stats()
+    assert stats["active_entries"] == 3
+    assert stats["evictions"] == 1
+    # id=1 must STILL be present (re-check is duplicate)
+    r1_again = engine.check({"id": 1})
+    assert r1_again.is_duplicate is True, (
+        "id=1 was hot (4 hits) and must survive LRU eviction"
+    )
+    # id=2 must be gone (re-check is first_seen)
+    r2_again = engine.check({"id": 2})
+    assert r2_again.is_duplicate is False
+    assert r2_again.reason == "first_seen", (
+        "id=2 had oldest last_access_at and must be evicted"
+    )
+
+
+def test_repeated_access_protects_from_eviction():
+    """Hot records (event A 100x checks) survive eviction over cold records (event B 1x).
+
+    Eviction-1 (max_entries=2 then add 3rd) must remove B, not A.
+    """
+    engine = DeduplicationEngine(default_ttl_s=3600.0, max_entries=2)
+    # event A: 100 checks -> last_access_at very recent
+    for _ in range(100):
+        engine.check({"event": "A"})
+    # event B: 1 check older
+    time.sleep(0.001)
+    engine.check({"event": "B"})
+    # event A again -> bump last_access_at on A so B is now LRU
+    time.sleep(0.001)
+    engine.check({"event": "A"})
+    # Now insert C -> max_entries=2, must evict B (LRU)
+    time.sleep(0.001)
+    engine.check({"event": "C"})
+    assert engine.get_stats()["evictions"] == 1
+    # A must still be present
+    r_a = engine.check({"event": "A"})
+    assert r_a.is_duplicate is True, "Hot event A must survive"
+    # B must be gone
+    r_b = engine.check({"event": "B"})
+    assert r_b.is_duplicate is False, "Cold event B must be evicted"
+
+
+def test_last_access_at_updated_on_hit():
+    """Each hit on a duplicate updates last_access_at. RLock-protected."""
+    engine = DeduplicationEngine(default_ttl_s=3600.0)
+    payload = {"event": "access-update"}
+    engine.check(payload)
+    rec_before = engine.list_active()[0]
+    initial_access = rec_before.last_access_at
+    initial_first_seen = rec_before.first_seen_at
+    # Wait + hit again
+    time.sleep(0.01)
+    engine.check(payload)
+    rec_after = engine.list_active()[0]
+    # last_access_at must have advanced
+    assert rec_after.last_access_at > initial_access, (
+        "last_access_at must be updated on hit"
+    )
+    # first_seen_at must remain unchanged
+    assert rec_after.first_seen_at == initial_first_seen, (
+        "first_seen_at must NOT change on hit"
+    )
+    # hit_count must have incremented
+    assert rec_after.hit_count == 1
+
+
+def test_lru_with_force_expire():
+    """force_expire entfernt unabhaengig von last_access_at.
+
+    Even a hot record (recently accessed) is removed by force_expire.
+    """
+    engine = DeduplicationEngine(default_ttl_s=3600.0, max_entries=10)
+    # Hot record
+    payload = {"event": "force-lru-test"}
+    for _ in range(10):
+        engine.check(payload)
+    rec = engine.list_active()[0]
+    assert rec.hit_count == 9
+    # force_expire must remove it regardless of last_access_at
+    removed = engine.force_expire(rec.event_hash)
+    assert removed is True
+    # Now re-check is first_seen
+    after = engine.check(payload)
+    assert after.is_duplicate is False
+    assert after.reason == "first_seen"
+
+
+def test_event_record_last_access_at_default_to_first_seen():
+    """Backward-compat: EventRecord without last_access_at gets first_seen_at default."""
+    rec = EventRecord(event_hash="abc", first_seen_at=100.0, hit_count=0, ttl_s=60.0)
+    assert rec.last_access_at == 100.0
+
+
+def test_event_record_last_access_at_validation():
+    """last_access_at < first_seen_at is rejected."""
+    with pytest.raises(ValueError):
+        EventRecord(
+            event_hash="abc",
+            first_seen_at=100.0,
+            hit_count=0,
+            ttl_s=60.0,
+            last_access_at=50.0,  # < first_seen_at
+        )
+    # Equal is OK
+    rec = EventRecord(
+        event_hash="abc",
+        first_seen_at=100.0,
+        hit_count=0,
+        ttl_s=60.0,
+        last_access_at=100.0,
+    )
+    assert rec.last_access_at == 100.0
+    # Greater is OK
+    rec2 = EventRecord(
+        event_hash="abc",
+        first_seen_at=100.0,
+        hit_count=0,
+        ttl_s=60.0,
+        last_access_at=150.0,
+    )
+    assert rec2.last_access_at == 150.0

@@ -52,12 +52,19 @@ class RateLimitDecision:
 
 
 class RateLimiterPool:
-    """Multi-Tenant Token-Bucket Rate-Limiter.
+    """Multi-Tenant Token-Bucket Rate-Limiter mit Per-Tenant-Lock-Striping.
 
     Pre: default_capacity > 0, default_refill_rate > 0
-    Post: thread-safe; per-tenant isolated buckets;
+    Post: thread-safe; per-tenant isolated buckets + per-tenant locks;
+          registry-mutations (register_tenant, list_tenants) via _registry_lock;
+          bucket-mutations (acquire, release, get_state) via per-tenant lock;
           lazy-refill via time.time()-Delta;
           idempotent register_tenant; raises on unknown tenant.
+
+    W20-P3 Fix (Cross-LLM-V10 Gemini): vorher globaler _lock erzwang
+    Cross-Tenant-Synchronisation. Jetzt per-Tenant-Lock-Striping
+    (_tenant_locks: dict[tenant_id, RLock]) reduziert Lock-Contention
+    bei high-load Multi-Tenant-Workloads.
 
     Bio-Aequivalent: Glomerulaere-Filtration mit Tenant-spezifischer
     Filtrationsrate und Druck-Kappung (capacity + burst).
@@ -75,7 +82,24 @@ class RateLimiterPool:
         self.default_capacity = int(default_capacity)
         self.default_refill_rate = float(default_refill_rate)
         self._buckets: dict[str, dict] = {}
-        self._lock = threading.RLock()
+        self._tenant_locks: dict[str, threading.RLock] = {}
+        # Registry-Lock schuetzt _buckets + _tenant_locks Mutationen
+        # (register_tenant, list_tenants). Bucket-Mutations laufen ueber
+        # per-tenant lock fuer Lock-Striping.
+        self._registry_lock = threading.RLock()
+
+    def _get_tenant_lock(self, tenant_id: str) -> threading.RLock:
+        """Hole per-Tenant-Lock. Raises wenn tenant nicht registriert.
+
+        Pre: tenant_id non-empty.
+        Post: registry_lock kurz fuer Lookup gehalten, dann freigegeben.
+              Returned Lock wird vom Caller acquired.
+        """
+        with self._registry_lock:
+            lock = self._tenant_locks.get(tenant_id)
+            if lock is None:
+                raise ValueError(f"unknown tenant: {tenant_id!r}")
+            return lock
 
     def register_tenant(
         self,
@@ -88,7 +112,11 @@ class RateLimiterPool:
 
         Pre: tenant_id non-empty
         Post: idempotent if same config;
-              raises ValueError if tenant_id already registered with different config.
+              raises ValueError if tenant_id already registered with different config;
+              creates per-tenant RLock entry in _tenant_locks.
+
+        Lock-Strategy: registry_lock (W20-P3) schuetzt _buckets + _tenant_locks
+        Mutationen.
         """
         if not tenant_id:
             raise ValueError("tenant_id must be non-empty")
@@ -100,7 +128,7 @@ class RateLimiterPool:
             refill_rate=rate,
             burst_allowance=int(burst_allowance),
         )
-        with self._lock:
+        with self._registry_lock:
             existing = self._buckets.get(tenant_id)
             if existing is not None:
                 existing_config: TenantConfig = existing["config"]
@@ -114,6 +142,7 @@ class RateLimiterPool:
                 "tokens": float(cap + config.burst_allowance),
                 "last_refill": time.time(),
             }
+            self._tenant_locks[tenant_id] = threading.RLock()
             return config
 
     def _refill(self, bucket: dict, now: float) -> None:
@@ -134,12 +163,19 @@ class RateLimiterPool:
 
         Pre: tenant_id registered; tokens >= 1
         Post: returns RateLimitDecision; consumes tokens iff allowed.
+
+        Lock-Strategy (W20-P3): registry_lock kurz fuer tenant-existence-check,
+        dann tenant-lock fuer bucket-mutation. Per-Tenant-Lock-Striping vermeidet
+        Cross-Tenant-Synchronisation.
         """
         if tokens < 1:
             raise ValueError("tokens must be >= 1")
-        with self._lock:
+        tenant_lock = self._get_tenant_lock(tenant_id)
+        with tenant_lock:
+            # Re-fetch bucket inside tenant lock (immutable mapping reference)
             bucket = self._buckets.get(tenant_id)
             if bucket is None:
+                # Race: tenant was unregistered between _get_tenant_lock and here.
                 raise ValueError(f"unknown tenant: {tenant_id!r}")
             now = time.time()
             self._refill(bucket, now)
@@ -173,11 +209,14 @@ class RateLimiterPool:
         """Return tokens manually (e.g. on cancellation).
 
         Pre: tenant_id registered; tokens >= 1
-        Post: tokens added back, capped at capacity + burst_allowance
+        Post: tokens added back, capped at capacity + burst_allowance.
+
+        Lock-Strategy (W20-P3): tenant-lock only.
         """
         if tokens < 1:
             raise ValueError("tokens must be >= 1")
-        with self._lock:
+        tenant_lock = self._get_tenant_lock(tenant_id)
+        with tenant_lock:
             bucket = self._buckets.get(tenant_id)
             if bucket is None:
                 raise ValueError(f"unknown tenant: {tenant_id!r}")
@@ -191,8 +230,11 @@ class RateLimiterPool:
         Pre: tenant_id registered
         Post: returns dict with tokens, capacity, refill_rate, burst_allowance,
               last_refill (snapshot, not live reference).
+
+        Lock-Strategy (W20-P3): tenant-lock only.
         """
-        with self._lock:
+        tenant_lock = self._get_tenant_lock(tenant_id)
+        with tenant_lock:
             bucket = self._buckets.get(tenant_id)
             if bucket is None:
                 raise ValueError(f"unknown tenant: {tenant_id!r}")
@@ -209,8 +251,11 @@ class RateLimiterPool:
             }
 
     def list_tenants(self) -> list[str]:
-        """Returns sorted list of registered tenant_ids."""
-        with self._lock:
+        """Returns sorted list of registered tenant_ids.
+
+        Lock-Strategy (W20-P3): registry_lock fuer registry-snapshot.
+        """
+        with self._registry_lock:
             return sorted(self._buckets.keys())
 
 

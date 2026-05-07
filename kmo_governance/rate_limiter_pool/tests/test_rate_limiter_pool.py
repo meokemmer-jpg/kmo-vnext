@@ -278,4 +278,177 @@ def test_tenant_isolation():
     assert d_b.allowed is True
 
 
+# --- W20-P3: Per-Tenant-Lock-Striping Tests (Welle-20 Patch-2) ---
+
+
+def test_per_tenant_locking_no_cross_tenant_blocking():
+    """Two tenants in parallel achieve high throughput (no global lock contention).
+
+    W20-P3 Fix (Cross-LLM-V10 Gemini): per-tenant locks vermeiden
+    Cross-Tenant-Synchronisation. Test ist eher Sanity-Check als
+    Performance-Benchmark — wenn ueber globalen Lock alle 2000 Acquires
+    serialisiert wuerden, dauert es laenger als per-tenant.
+    """
+    pool = RateLimiterPool()
+    pool.register_tenant("tenant-X", capacity=2000, refill_rate=1.0)
+    pool.register_tenant("tenant-Y", capacity=2000, refill_rate=1.0)
+
+    grants_x: list[int] = []
+    grants_y: list[int] = []
+    barrier = threading.Barrier(2)
+
+    def worker_x() -> None:
+        barrier.wait()
+        for _ in range(1000):
+            d = pool.acquire("tenant-X", tokens=1)
+            if d.allowed:
+                grants_x.append(1)
+
+    def worker_y() -> None:
+        barrier.wait()
+        for _ in range(1000):
+            d = pool.acquire("tenant-Y", tokens=1)
+            if d.allowed:
+                grants_y.append(1)
+
+    t_start = time.time()
+    t_x = threading.Thread(target=worker_x)
+    t_y = threading.Thread(target=worker_y)
+    t_x.start()
+    t_y.start()
+    t_x.join()
+    t_y.join()
+    elapsed = time.time() - t_start
+
+    # Both tenants must succeed independently (no cross-blocking)
+    assert sum(grants_x) == 1000
+    assert sum(grants_y) == 1000
+    # Sanity: parallel run should be reasonably fast (not strict assertion,
+    # but if global lock would serialize all 2000 acquires, expect > 1s typically)
+    assert elapsed < 5.0, f"Parallel run took unexpectedly long: {elapsed:.3f}s"
+
+
+def test_registry_lock_protects_register():
+    """register_tenant ist thread-safe via registry_lock.
+
+    50 Threads versuchen denselben tenant zu registrieren. Genau einer gewinnt
+    (die anderen sehen idempotente Re-Registration mit gleicher Config).
+    """
+    pool = RateLimiterPool()
+    results: list[TenantConfig] = []
+    results_lock = threading.Lock()
+
+    def worker() -> None:
+        cfg = pool.register_tenant(
+            "concurrent-tenant", capacity=10, refill_rate=1.0, burst_allowance=0
+        )
+        with results_lock:
+            results.append(cfg)
+
+    threads = [threading.Thread(target=worker) for _ in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # All 50 calls returned (idempotent register)
+    assert len(results) == 50
+    # All configs identical
+    first = results[0]
+    for cfg in results:
+        assert cfg == first
+    # Tenant-list contains exactly one entry
+    assert pool.list_tenants() == ["concurrent-tenant"]
+
+
+def test_concurrent_register_and_acquire_thread_safe():
+    """50 Threads gemischt register + acquire. Keine Race-Condition / Crash."""
+    pool = RateLimiterPool(default_capacity=1000, default_refill_rate=10.0)
+    pool.register_tenant("primary", capacity=2000, refill_rate=10.0)
+
+    errors: list[Exception] = []
+    errors_lock = threading.Lock()
+    granted = []
+    granted_lock = threading.Lock()
+
+    def register_worker(idx: int) -> None:
+        try:
+            pool.register_tenant(f"new-tenant-{idx}", capacity=100, refill_rate=5.0)
+        except Exception as e:  # pragma: no cover - thread safety test
+            with errors_lock:
+                errors.append(e)
+
+    def acquire_worker() -> None:
+        try:
+            for _ in range(20):
+                d = pool.acquire("primary", tokens=1)
+                if d.allowed:
+                    with granted_lock:
+                        granted.append(1)
+        except Exception as e:  # pragma: no cover
+            with errors_lock:
+                errors.append(e)
+
+    threads: list[threading.Thread] = []
+    # 25 register workers + 25 acquire workers
+    for i in range(25):
+        threads.append(threading.Thread(target=register_worker, args=(i,)))
+        threads.append(threading.Thread(target=acquire_worker))
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"Unexpected exceptions: {errors}"
+    # 25 new tenants + primary
+    assert len(pool.list_tenants()) == 26
+    # All 25 acquire-workers completed 20 acquires each = 500 total grants
+    assert sum(granted) == 500
+
+
+def test_tenant_lock_isolation():
+    """Tenant A acquire blockiert NICHT tenant B.
+
+    Wir erzwingen einen langen acquire auf tenant A (over hash_fn-Sleep nicht
+    moeglich, aber via Hold-Pattern in einem Thread). Test zeigt: B kann
+    parallel arbeiten.
+    """
+    pool = RateLimiterPool()
+    pool.register_tenant("hold-a", capacity=10, refill_rate=1.0)
+    pool.register_tenant("active-b", capacity=10, refill_rate=1.0)
+
+    a_lock = pool._get_tenant_lock("hold-a")
+    b_done = threading.Event()
+    a_holding = threading.Event()
+    a_release = threading.Event()
+
+    def hold_a() -> None:
+        # Acquire tenant-A's lock manually and hold it
+        with a_lock:
+            a_holding.set()
+            a_release.wait(timeout=2.0)
+
+    def use_b() -> None:
+        # While A is held, B-operations must succeed
+        a_holding.wait(timeout=2.0)
+        d = pool.acquire("active-b", tokens=5)
+        state = pool.get_state("active-b")
+        # Allow tiny refill (refill_rate=1.0 -> ~0 in microseconds)
+        if d.allowed and 5.0 <= state["tokens"] < 5.1:
+            b_done.set()
+
+    t_a = threading.Thread(target=hold_a)
+    t_b = threading.Thread(target=use_b)
+    t_a.start()
+    t_b.start()
+    # B should complete despite A holding its lock
+    completed = b_done.wait(timeout=2.0)
+    a_release.set()
+    t_a.join()
+    t_b.join()
+
+    assert completed, "tenant-B was blocked by tenant-A lock (lock-striping broken)"
+
+
 # CRUX-MK
