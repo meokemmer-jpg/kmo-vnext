@@ -1,0 +1,138 @@
+# KMO DEV-Stage Docker Compose [CRUX-MK]
+# Mac-Local Development Stack with Cloudflare Tunnel for Public-URL Sharing.
+# Spec: branch-hub/blueprints/SPEC-KMO-DEV-STAGE-CLOUDFLARE-DOCKER-2026-04-30.md
+# Architekt-Decided Option C: Mac-Local Docker + Cloudflare-Tunnel.
+# NOT FOR PRODUCTION. K_0/Q_0-relevante Daten NIE hier rein.
+
+version: "3.9"
+
+networks:
+  kmo-net:
+    driver: bridge
+
+volumes:
+  kmo-data:
+    driver: local
+  kmo-audit:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      # Read-only mount of branch-hub audit-trail for demo dashboard.
+      device: ${KMO_AUDIT_HOST_PATH:-/Users/make/Library/CloudStorage/GoogleDrive-m.e.o.kemmer@gmail.com/Meine Ablage/Claude-Knowledge-System/branch-hub/audit}
+
+services:
+  kmo-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: kmo-gateway
+    environment:
+      - KMO_LOG_LEVEL=${KMO_LOG_LEVEL:-DEBUG}
+      - KMO_DEMO_AUTH_USER=${KMO_DEMO_AUTH_USER:-martin}
+      - KMO_DEMO_AUTH_PASS=${KMO_DEMO_AUTH_PASS:-change-me}
+    ports:
+      - "8081:8080"  # Host-Port 8081 (8080 belegt von open-webui)
+    volumes:
+      - kmo-audit:/app/audit:ro
+      - kmo-data:/app/data
+    networks:
+      - kmo-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  approval-gate:
+    build:
+      context: ../kmo_governance/approval-gate
+    container_name: kmo-approval-gate
+    environment:
+      - KMO_APPROVAL_SECRET=${KMO_APPROVAL_SECRET:-change-me-in-prod-32-bytes-min}
+      - KMO_LOG_LEVEL=${KMO_LOG_LEVEL:-DEBUG}
+    networks:
+      - kmo-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  lease-manager:
+    build:
+      context: ../kmo_governance/lease-manager
+    container_name: kmo-lease-manager
+    environment:
+      - KMO_LOG_LEVEL=${KMO_LOG_LEVEL:-DEBUG}
+    volumes:
+      - kmo-data:/app/data
+    networks:
+      - kmo-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  data-class-filter:
+    build:
+      context: ../kmo_governance/data-class-filter
+    container_name: kmo-data-class-filter
+    environment:
+      - KMO_LOG_LEVEL=${KMO_LOG_LEVEL:-DEBUG}
+    networks:
+      - kmo-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  saga-pattern:
+    build:
+      context: ../kmo_governance/saga-pattern
+    container_name: kmo-saga-engine
+    environment:
+      - KMO_LOG_LEVEL=${KMO_LOG_LEVEL:-DEBUG}
+    networks:
+      - kmo-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  outbox-pattern:
+    build:
+      context: ../kmo_governance/outbox-pattern
+    container_name: kmo-outbox
+    environment:
+      - KMO_LOG_LEVEL=${KMO_LOG_LEVEL:-DEBUG}
+    networks:
+      - kmo-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: kmo-cloudflared
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+    networks:
+      - kmo-net
+    depends_on:
+      kmo-gateway:
+        condition: service_healthy
+    restart: unless-stopped

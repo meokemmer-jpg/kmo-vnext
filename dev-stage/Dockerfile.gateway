@@ -1,0 +1,37 @@
+# KMO Gateway Stub Dockerfile [CRUX-MK]
+# Placeholder service for KMO DEV-Stage public demo dashboard.
+# NOT FOR PRODUCTION.
+
+FROM python:3.11-slim
+
+LABEL maintainer="kemmer-kmo-dev-stage"
+LABEL kmo.component="gateway-stub"
+LABEL kmo.stage="dev"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# Minimal deps -- stdlib http.server is enough for stub.
+# requirements.txt kept for future expansion (FastAPI/uvicorn migration).
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy stub server.
+COPY kmo_gateway_stub.py /app/kmo_gateway_stub.py
+
+# Audit + data dirs (mounted via volumes in compose).
+RUN mkdir -p /app/audit /app/data
+
+# Non-root user for safety.
+RUN useradd --create-home --shell /bin/bash kmo \
+    && chown -R kmo:kmo /app
+USER kmo
+
+EXPOSE 8080
+
+# Healthcheck handled by docker-compose.
+CMD ["python", "-m", "kmo_gateway_stub"]

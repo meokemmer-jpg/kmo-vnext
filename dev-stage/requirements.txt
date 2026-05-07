@@ -1,0 +1,2 @@
+# KMO Gateway Stub -- minimal deps. stdlib http.server suffices for DEV.
+# Add FastAPI/uvicorn here when migrating to production gateway.

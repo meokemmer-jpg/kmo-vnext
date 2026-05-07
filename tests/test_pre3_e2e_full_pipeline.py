@@ -29,10 +29,10 @@ import pytest
 # sys.path-Erweiterung damit alle 6 Module importierbar sind
 KMO_ROOT = Path(__file__).resolve().parent.parent
 for mod in [
-    "kmo_governance/data-class-filter",
-    "kmo_governance/lease-manager",
+    "kmo_governance/data_class_filter",
+    "kmo_governance/lease_manager",
     "kmo_governance/approval-gate",
-    "kmo_governance/durable-execution",
+    "kmo_governance/durable_execution",
     "kmo_governance/saga-pattern",
     "kmo_governance/outbox-pattern",
 ]:
@@ -55,10 +55,10 @@ def pipeline_dirs(tmp_path: Path) -> dict:
     """Frische Pfade fuer alle 6 Module pro Test."""
     return {
         "filter_audit": tmp_path / "filter-audit.jsonl",
-        "filter_config": KMO_ROOT / "kmo_governance/data-class-filter/provider_compat.yaml",
+        "filter_config": KMO_ROOT / "kmo_governance/data_class_filter/provider_compat.yaml",
         "lease_db": tmp_path / "leases.db",
         "lease_flags": tmp_path / "stop-flags",
-        "lease_schema": KMO_ROOT / "kmo_governance/lease-manager/schema.sql",
+        "lease_schema": KMO_ROOT / "kmo_governance/lease_manager/schema.sql",
         "state_root": tmp_path / "durable-state",
         "saga_state": tmp_path / "saga-state",
         "outbox": tmp_path / "outbox",
