@@ -17,7 +17,7 @@
 `kmo_governance/kpm_trading_failover/` (Welle-23 Phase-16, Trading-Domain)
 
 - Use-Case: KPM-Familien-Trading-Strategie-Failover (z.B. Aggressive Kelly 0.4 primary, Conservative Kelly 0.2 standby)
-- 14 Tests passing, ~330 LoC
+- 16 Tests passing, ~330 LoC
 - KPM-Domain-spezifisch: Kelly-Fraction-Constraints (rules/kpm-sizing.md Variante-D)
 
 ## Isomorphie-Tabelle
@@ -114,7 +114,7 @@ Damit laesst sich Bio-Pattern-Lift in 50+ weiteren Modulen replizieren:
 
 ## Verifikations-Status
 
-- ✓ Alle 14 KPM-Tests passing
+- ✓ Alle 16 KPM-Tests passing
 - ✓ Pattern-Isomorphie strikt eingehalten (siehe Tabelle oben)
 - ✓ Pre/Post-Conditions dokumentiert
 - ✓ Thread-Safety verifiziert (50-Thread-Stress-Test)

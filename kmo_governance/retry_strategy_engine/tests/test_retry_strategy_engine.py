@@ -402,4 +402,307 @@ def test_execute_uses_per_call_config_override() -> None:
     assert outcome.total_attempts == 2  # override_cfg.max_attempts, not default's 5
 
 
+# ---------------------------------------------------------------------------
+# W20-P1 Patch Tests (Welle-25 Phase-18, 2026-05-07)
+# Custom-Strategy-by-Name + HTTP-Status-Aware-Stop-Condition
+# ---------------------------------------------------------------------------
+
+
+def test_retry_config_accepts_string_strategy_name() -> None:
+    """W20-P1: RetryConfig.strategy can be a plain str (custom strategy name)."""
+    # Plain str is accepted at config-creation
+    cfg = RetryConfig(
+        max_attempts=3,
+        base_delay_s=0.001,
+        max_delay_s=0.01,
+        strategy="my_custom_strategy",
+    )
+    assert cfg.strategy == "my_custom_strategy"
+    assert isinstance(cfg.strategy, str)
+    # Empty string rejected
+    with pytest.raises(ValueError, match="strategy str must be non-empty"):
+        RetryConfig(
+            max_attempts=3,
+            base_delay_s=0.001,
+            max_delay_s=0.01,
+            strategy="",
+        )
+
+
+def test_retry_engine_dispatches_to_custom_strategy_function() -> None:
+    """W20-P1: compute_delay correctly dispatches to registered custom strategies."""
+    cfg_default = RetryConfig(max_attempts=3, base_delay_s=1.0, max_delay_s=100.0)
+    engine = RetryEngine(default_config=cfg_default)
+
+    def cubic(attempt: int, c: RetryConfig) -> float:
+        return (attempt ** 3) * c.base_delay_s
+
+    engine.register_strategy("cubic", cubic)
+
+    cfg = RetryConfig(
+        max_attempts=5,
+        base_delay_s=1.0,
+        max_delay_s=1000.0,
+        strategy="cubic",
+    )
+    # attempt=1 -> 1, attempt=2 -> 8, attempt=3 -> 27
+    assert engine.compute_delay(1, cfg) == pytest.approx(1.0)
+    assert engine.compute_delay(2, cfg) == pytest.approx(8.0)
+    assert engine.compute_delay(3, cfg) == pytest.approx(27.0)
+
+
+def test_retry_config_unknown_string_strategy_raises() -> None:
+    """W20-P1: Unknown custom-strategy name raises at compute_delay time."""
+    cfg_default = RetryConfig(max_attempts=3, base_delay_s=0.001, max_delay_s=0.01)
+    engine = RetryEngine(default_config=cfg_default)
+
+    cfg = RetryConfig(
+        max_attempts=3,
+        base_delay_s=0.001,
+        max_delay_s=0.01,
+        strategy="never_registered",
+    )
+    with pytest.raises(ValueError, match="unknown custom strategy"):
+        engine.compute_delay(1, cfg)
+
+
+def test_stop_condition_aborts_retry_early() -> None:
+    """W20-P1: stop_condition returning True aborts retry-loop immediately."""
+    cfg = RetryConfig(
+        max_attempts=10,
+        base_delay_s=0.001,
+        max_delay_s=0.01,
+        strategy=RetryStrategy.CONSTANT,
+        stop_condition=lambda exc: isinstance(exc, ValueError),
+    )
+    engine = RetryEngine(default_config=cfg)
+
+    counter = {"calls": 0}
+
+    def fail_with_value_error() -> None:
+        counter["calls"] += 1
+        raise ValueError("non-retriable")
+
+    outcome = engine.execute(fail_with_value_error)
+    assert outcome.success is False
+    assert outcome.total_attempts == 1  # aborted after 1st failure
+    assert outcome.stopped_by_condition is True
+    assert counter["calls"] == 1
+    assert "non-retriable" in (outcome.final_error or "")
+
+
+def test_stop_condition_optional_default_continues_retry() -> None:
+    """W20-P1: stop_condition=None (default) -> all attempts used until max."""
+    cfg = RetryConfig(
+        max_attempts=4,
+        base_delay_s=0.001,
+        max_delay_s=0.01,
+        strategy=RetryStrategy.CONSTANT,
+        # no stop_condition -> default None
+    )
+    engine = RetryEngine(default_config=cfg)
+
+    def always_fail() -> None:
+        raise RuntimeError("transient")
+
+    outcome = engine.execute(always_fail)
+    assert outcome.success is False
+    assert outcome.total_attempts == 4  # full max_attempts used
+    assert outcome.stopped_by_condition is False
+
+
+def test_stop_condition_invalid_type_raises() -> None:
+    """W20-P1: stop_condition must be callable or None."""
+    with pytest.raises(ValueError, match="stop_condition must be callable or None"):
+        RetryConfig(
+            max_attempts=3,
+            base_delay_s=0.001,
+            max_delay_s=0.01,
+            stop_condition="not_a_callable",  # type: ignore[arg-type]
+        )
+
+
+def test_http_status_aware_stop_condition_4xx_stops() -> None:
+    """W20-P1 builtin: HTTP-403/404 (4xx not 408/429) stops retry."""
+    class HttpException(Exception):
+        def __init__(self, status_code: int, message: str = "") -> None:
+            super().__init__(message)
+            self.status_code = status_code
+
+    cfg = RetryConfig(
+        max_attempts=10,
+        base_delay_s=0.001,
+        max_delay_s=0.01,
+        strategy=RetryStrategy.CONSTANT,
+        stop_condition=RetryEngine.http_status_aware_stop_condition,
+    )
+    engine = RetryEngine(default_config=cfg)
+
+    counter = {"calls": 0}
+
+    def fail_with_403() -> None:
+        counter["calls"] += 1
+        raise HttpException(status_code=403, message="forbidden")
+
+    outcome = engine.execute(fail_with_403)
+    assert outcome.stopped_by_condition is True
+    assert outcome.total_attempts == 1
+    assert counter["calls"] == 1
+
+    # Also check 404
+    counter2 = {"calls": 0}
+
+    def fail_with_404() -> None:
+        counter2["calls"] += 1
+        raise HttpException(status_code=404, message="not-found")
+
+    outcome2 = engine.execute(fail_with_404)
+    assert outcome2.stopped_by_condition is True
+    assert outcome2.total_attempts == 1
+
+
+def test_http_status_aware_stop_condition_5xx_continues() -> None:
+    """W20-P1 builtin: HTTP-503 (5xx) does NOT stop retry."""
+    class HttpException(Exception):
+        def __init__(self, status_code: int, message: str = "") -> None:
+            super().__init__(message)
+            self.status_code = status_code
+
+    cfg = RetryConfig(
+        max_attempts=3,
+        base_delay_s=0.001,
+        max_delay_s=0.01,
+        strategy=RetryStrategy.CONSTANT,
+        stop_condition=RetryEngine.http_status_aware_stop_condition,
+    )
+    engine = RetryEngine(default_config=cfg)
+
+    counter = {"calls": 0}
+
+    def fail_with_503() -> None:
+        counter["calls"] += 1
+        raise HttpException(status_code=503, message="service-unavailable")
+
+    outcome = engine.execute(fail_with_503)
+    assert outcome.stopped_by_condition is False
+    assert outcome.total_attempts == 3  # full max_attempts used (5xx is retry-friendly)
+    assert counter["calls"] == 3
+
+
+def test_http_status_aware_stop_condition_429_continues() -> None:
+    """W20-P1 builtin: HTTP-429 (rate limit) is retry-friendly with backoff."""
+    class HttpException(Exception):
+        def __init__(self, status_code: int, message: str = "") -> None:
+            super().__init__(message)
+            self.status_code = status_code
+
+    cfg = RetryConfig(
+        max_attempts=3,
+        base_delay_s=0.001,
+        max_delay_s=0.01,
+        strategy=RetryStrategy.CONSTANT,
+        stop_condition=RetryEngine.http_status_aware_stop_condition,
+    )
+    engine = RetryEngine(default_config=cfg)
+
+    counter = {"calls": 0}
+
+    def fail_with_429() -> None:
+        counter["calls"] += 1
+        raise HttpException(status_code=429, message="rate-limit")
+
+    outcome = engine.execute(fail_with_429)
+    assert outcome.stopped_by_condition is False
+    assert outcome.total_attempts == 3
+
+
+def test_http_status_aware_stop_condition_408_continues() -> None:
+    """W20-P1 builtin: HTTP-408 (request timeout) is retry-friendly."""
+    class HttpException(Exception):
+        def __init__(self, status_code: int, message: str = "") -> None:
+            super().__init__(message)
+            self.status_code = status_code
+
+    cfg = RetryConfig(
+        max_attempts=3,
+        base_delay_s=0.001,
+        max_delay_s=0.01,
+        strategy=RetryStrategy.CONSTANT,
+        stop_condition=RetryEngine.http_status_aware_stop_condition,
+    )
+    engine = RetryEngine(default_config=cfg)
+
+    def fail_with_408() -> None:
+        raise HttpException(status_code=408, message="timeout")
+
+    outcome = engine.execute(fail_with_408)
+    assert outcome.stopped_by_condition is False
+    assert outcome.total_attempts == 3
+
+
+def test_http_status_aware_stop_condition_no_status_attr_continues() -> None:
+    """W20-P1 builtin: Exception without status_code attribute -> conservative retry."""
+    cfg = RetryConfig(
+        max_attempts=3,
+        base_delay_s=0.001,
+        max_delay_s=0.01,
+        strategy=RetryStrategy.CONSTANT,
+        stop_condition=RetryEngine.http_status_aware_stop_condition,
+    )
+    engine = RetryEngine(default_config=cfg)
+
+    def fail_no_status() -> None:
+        raise RuntimeError("plain-error-no-http-status")
+
+    outcome = engine.execute(fail_no_status)
+    # Conservative: no status -> allow retry to completion
+    assert outcome.stopped_by_condition is False
+    assert outcome.total_attempts == 3
+
+
+def test_http_status_aware_stop_condition_alt_attribute_names() -> None:
+    """W20-P1 builtin: Recognizes status_code, http_status_code, code attributes."""
+    class HttpStatusCodeAttr(Exception):
+        def __init__(self) -> None:
+            super().__init__("alt-attr")
+            self.http_status_code = 401  # alternative attr name
+
+    class CodeAttr(Exception):
+        def __init__(self) -> None:
+            super().__init__("alt-attr")
+            self.code = 403  # third alternative
+
+    # Both should be recognized -> stop
+    assert (
+        RetryEngine.http_status_aware_stop_condition(HttpStatusCodeAttr()) is True
+    ), "http_status_code attribute not recognized"
+    assert (
+        RetryEngine.http_status_aware_stop_condition(CodeAttr()) is True
+    ), "code attribute not recognized"
+
+
+def test_stop_condition_callback_exception_does_not_break_loop() -> None:
+    """W20-P1: If stop_condition itself raises, treat as 'do not stop' (continue)."""
+
+    def buggy_cond(exc: Exception) -> bool:
+        raise RuntimeError("buggy stop_condition")
+
+    cfg = RetryConfig(
+        max_attempts=3,
+        base_delay_s=0.001,
+        max_delay_s=0.01,
+        strategy=RetryStrategy.CONSTANT,
+        stop_condition=buggy_cond,
+    )
+    engine = RetryEngine(default_config=cfg)
+
+    def always_fail() -> None:
+        raise ValueError("transient")
+
+    outcome = engine.execute(always_fail)
+    # Buggy cond -> treated as "no stop" -> full retries
+    assert outcome.stopped_by_condition is False
+    assert outcome.total_attempts == 3
+
+
 # CRUX-MK
