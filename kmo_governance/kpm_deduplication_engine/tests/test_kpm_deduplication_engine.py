@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from kpm_deduplication_engine.kpm_deduplication_engine import (
+from kmo_governance.kpm_deduplication_engine import (
     KPMDeduplicationEngine,
     OrderRecord,
     TradeDedupResult,
