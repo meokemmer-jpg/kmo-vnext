@@ -54,7 +54,7 @@ kurzlebig).
 - **W_0 (Working Capital):** Sweep-on-Acquire haelt amortisierten O(1)-Overhead auch
   bei hoher Order-Frequenz.
 
-## Tests (17 stueck)
+## Tests (18 stueck)
 
 1. `test_init_validation` — TTL/Sweep > 0
 2. `test_acquire_free_lock_long` — Erfolg + Lease + Token
