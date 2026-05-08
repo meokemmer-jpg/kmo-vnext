@@ -552,4 +552,202 @@ def test_execute_saga_empty_steps_raises():
         orch.execute_saga([], saga_id="empty-001")
 
 
+# ---------------------------------------------------------------------------
+# P-V13-2 (a): Handler-Snapshot-Isolation (TOCTOU-Fix)
+# ---------------------------------------------------------------------------
+
+
+def test_handler_snapshot_isolated_from_concurrent_register():
+    """V13-2 (a): handler-snapshot wird am Saga-Start eingefroren.
+
+    Concurrent register_handler waehrend laufender Saga aendert NICHT
+    den Saga-Pfad — Saga arbeitet weiter mit dem Handler von Saga-Start.
+    """
+    orch = KPMSagaOrchestrator()
+
+    handler_v1_calls: list[str] = []
+    handler_v2_calls: list[str] = []
+
+    saga_started = threading.Event()
+    handler_continue = threading.Event()
+
+    def slow_handler_v1(step):
+        handler_v1_calls.append(step.step_id)
+        if step.step_id == "s1":
+            saga_started.set()
+            # Block bis Test concurrent register triggert
+            handler_continue.wait(timeout=2.0)
+        return {"ok": True, "version": "v1"}
+
+    def handler_v2(step):
+        handler_v2_calls.append(step.step_id)
+        return {"ok": True, "version": "v2"}
+
+    # V1 fuer alle Phasen registrieren
+    for phase in SagaPhase:
+        orch.register_handler(phase, slow_handler_v1)
+    _all_phase_compensators(orch)
+
+    steps = [
+        _step("s1", SagaPhase.VALIDATE),
+        _step("s2", SagaPhase.RESERVE),
+        _step("s3", SagaPhase.EXECUTE),
+    ]
+
+    outcome_holder: list[SagaOutcome] = []
+
+    def run_saga():
+        outcome_holder.append(orch.execute_saga(steps, saga_id="snapshot-001"))
+
+    saga_thread = threading.Thread(target=run_saga)
+    saga_thread.start()
+
+    # Warte bis s1 den slow_handler erreicht hat
+    saga_started.wait(timeout=2.0)
+
+    # JETZT registriere V2 (concurrent zum laufenden Saga)
+    for phase in SagaPhase:
+        orch.register_handler(phase, handler_v2)
+
+    # Handler darf weiter
+    handler_continue.set()
+    saga_thread.join(timeout=3.0)
+
+    # Saga muss komplett mit V1 gelaufen sein (nicht V2)
+    assert len(outcome_holder) == 1
+    outcome = outcome_holder[0]
+    assert outcome.state == SagaState.COMPLETED
+    # V1 hat alle 3 Steps gesehen, V2 keinen
+    assert handler_v1_calls == ["s1", "s2", "s3"]
+    assert handler_v2_calls == []
+
+
+# ---------------------------------------------------------------------------
+# P-V13-2 (b): saga_id-Collision-Check
+# ---------------------------------------------------------------------------
+
+
+def test_saga_id_collision_raises():
+    """V13-2 (b): Concurrent execute_saga mit gleicher saga_id raises RuntimeError."""
+    orch = KPMSagaOrchestrator()
+    _all_phase_handlers(orch)
+    _all_phase_compensators(orch)
+
+    # Erst-Saga mit saga_id 'collision-001' fertig
+    steps_a = [_step("s1", SagaPhase.VALIDATE)]
+    outcome_a = orch.execute_saga(steps_a, saga_id="collision-001")
+    assert outcome_a.state == SagaState.COMPLETED
+
+    # Zweiter Aufruf mit gleicher saga_id -> Collision (saga_id im outcomes)
+    with pytest.raises(RuntimeError, match="already in outcomes"):
+        orch.execute_saga(steps_a, saga_id="collision-001")
+
+    # In-progress Collision: Saga-Thread haengt im handler, parallel-execute mit gleicher id
+    saga_started = threading.Event()
+    handler_continue = threading.Event()
+
+    def slow_handler(step):
+        saga_started.set()
+        handler_continue.wait(timeout=2.0)
+        return {"ok": True}
+
+    orch2 = KPMSagaOrchestrator()
+    orch2.register_handler(SagaPhase.VALIDATE, slow_handler)
+    _all_phase_compensators(orch2)
+
+    steps_b = [_step("s1", SagaPhase.VALIDATE)]
+
+    def run_long():
+        orch2.execute_saga(steps_b, saga_id="in-progress-001")
+
+    bg_thread = threading.Thread(target=run_long)
+    bg_thread.start()
+    saga_started.wait(timeout=2.0)
+
+    # Concurrent Saga-Aufruf mit gleicher saga_id -> in_progress Collision
+    with pytest.raises(RuntimeError, match="already in_progress"):
+        orch2.execute_saga(steps_b, saga_id="in-progress-001")
+
+    handler_continue.set()
+    bg_thread.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# P-V13-2 (c): In-flight Cancellation (Steps die nach cancel-signal completen)
+# ---------------------------------------------------------------------------
+
+
+def test_cancellation_includes_completed_steps_in_compensation():
+    """V13-2 (c): Steps die nach cancel-signal SUCCEEDED muessen kompensiert werden.
+
+    Cancel kommt zwischen handler-call (s1 succeeded) und naechstem Step (s2).
+    Resultat: completed_steps=(s1,) -> s1 wird kompensiert.
+    Resultat-State: COMPENSATED (nicht FAILED, da Compensation OK).
+    """
+    orch = KPMSagaOrchestrator()
+
+    saga_started = threading.Event()
+    cancel_event = threading.Event()
+    s1_completed = threading.Event()
+
+    def s1_handler(step):
+        # s1 schliesst NORMAL ab
+        s1_completed.set()
+        return {"ok": True}
+
+    def s2_handler(step):
+        # s2 wartet bis cancel kommt — wir wollen Cancel-Check VOR s2 schlagen
+        saga_started.set()
+        cancel_event.wait(timeout=2.0)
+        return {"ok": True}
+
+    orch.register_handler(SagaPhase.VALIDATE, s1_handler)
+    orch.register_handler(SagaPhase.RESERVE, s2_handler)
+    for phase in (SagaPhase.EXECUTE, SagaPhase.CONFIRM, SagaPhase.SETTLE):
+        orch.register_handler(phase, lambda step: {"ok": True})
+
+    s1_compensated: list[str] = []
+
+    def s1_compensator(step):
+        s1_compensated.append(step.step_id)
+
+    orch.register_compensator(SagaPhase.VALIDATE, s1_compensator)
+
+    steps = [
+        _step("s1", SagaPhase.VALIDATE),
+        _step("s2", SagaPhase.RESERVE),
+        _step("s3", SagaPhase.EXECUTE),
+    ]
+
+    outcome_holder: list[SagaOutcome] = []
+
+    def run_saga():
+        outcome_holder.append(orch.execute_saga(steps, saga_id="cancel-completed-001"))
+
+    saga_thread = threading.Thread(target=run_saga)
+    saga_thread.start()
+
+    # Warte bis s1 done und s2 im handler haengt
+    s1_completed.wait(timeout=2.0)
+    saga_started.wait(timeout=2.0)
+
+    # JETZT cancel triggern (s1 ist completed, s2 haengt im handler)
+    assert orch.cancel_in_progress("cancel-completed-001") is True
+
+    # Lass s2 fertigwerden — V13-2 (c) sagt: s2 wird trotzdem in completed
+    cancel_event.set()
+    saga_thread.join(timeout=3.0)
+
+    assert len(outcome_holder) == 1
+    outcome = outcome_holder[0]
+
+    # s1 + s2 sind beide vor Cancel-Check completed (Cancel-Check ist NACH handler-call)
+    # Resultat: s1 + s2 sind in completed_steps, s3 wird durch cancel-Check geblockt
+    assert "s1" in outcome.completed_steps
+    assert "s2" in outcome.completed_steps
+    assert outcome.state == SagaState.COMPENSATED
+    # s1 wurde explizit kompensiert
+    assert "s1" in s1_compensated
+
+
 # CRUX-MK

@@ -266,16 +266,33 @@ class KPMSagaOrchestrator:
     ) -> SagaOutcome:
         """Execute saga: run alle Steps sequentiell, compensate on failure.
 
+        V13-Patches (P-V13-2):
+            (a) Handler-/Compensator-Snapshot:
+                Snapshots werden am Saga-Start unter Lock genommen. Nachfolgende
+                Lookups gehen gegen die Snapshots, NICHT gegen die Mutable-Registry.
+                Verhindert Handler-TOCTOU bei concurrent register_handler() calls.
+            (b) saga_id-Collision:
+                Raises RuntimeError, wenn saga_id bereits in_progress oder im
+                outcomes-store. Verhindert outcome-Ueberschreibung bei
+                concurrent execute() mit gleicher saga_id.
+            (c) In-flight Cancellation:
+                Steps die zwischen handler-call und cancel-check completen
+                werden trotzdem in completed_steps aufgenommen + bei
+                Cancellation in compensation_log compensiert.
+
         Pre:
             steps non-empty list of SagaStep.
             handler fuer jede in steps vorkommende Phase muss registriert sein.
             saga_id non-empty wenn provided, sonst auto-uuid4.
+            saga_id darf NICHT bereits in_progress oder outcomes sein (V13-2b).
 
         Post:
             Outcome persistiert in self._outcomes[saga_id].
             State = COMPLETED (alle Steps OK) oder COMPENSATED (ein Step
             failed + alle vorherigen kompensiert) oder FAILED (Step failed
             UND eine Compensation auch failed — degraded state).
+            Snapshots aus _handlers + _compensators sind isoliert von
+            concurrent register_*-Aenderungen.
 
         Returns:
             SagaOutcome mit final-state + completed_steps + compensation_log.
@@ -283,37 +300,50 @@ class KPMSagaOrchestrator:
         if not steps:
             raise ValueError("steps must be non-empty list")
 
-        # Phase-Registry-Pruefung: jede Step-Phase muss Handler haben
-        with self._lock:
-            for step in steps:
-                if step.phase not in self._handlers:
-                    raise ValueError(
-                        f"no handler registered for phase {step.phase.value!r}"
-                    )
-
         if saga_id is None:
             saga_id = str(uuid.uuid4())
         if not saga_id:
             raise ValueError("saga_id must be non-empty if provided")
 
+        # V13-2 (a): Snapshot Handler + Compensators unter Lock + Phase-Pruefung +
+        # V13-2 (b): saga_id-Collision-Check.
         with self._lock:
+            if saga_id in self._in_progress:
+                raise RuntimeError(
+                    f"saga_id {saga_id!r} already in_progress (V13-2 collision-check)"
+                )
+            if saga_id in self._outcomes:
+                raise RuntimeError(
+                    f"saga_id {saga_id!r} already in outcomes (V13-2 collision-check)"
+                )
+            for step in steps:
+                if step.phase not in self._handlers:
+                    raise ValueError(
+                        f"no handler registered for phase {step.phase.value!r}"
+                    )
+            handlers_snapshot: dict[SagaPhase, Callable[[SagaStep], dict]] = (
+                dict(self._handlers)
+            )
+            compensators_snapshot: dict[SagaPhase, Callable[[SagaStep], None]] = (
+                dict(self._compensators)
+            )
             self._in_progress[saga_id] = SagaState.IN_PROGRESS
 
         start = time.monotonic()
         completed_steps: list[str] = []
         failed_step: Optional[str] = None
         compensation_log: list[tuple] = []
+        # V13-2 (c): cancellation_triggered flag, gesetzt wenn Cancel-Check schlaegt
+        cancellation_triggered: bool = False
 
         # Sequentielle Ausfuehrung aller Steps
         for step in steps:
-            # Cancel-Check (cancel_in_progress wurde aufgerufen)
-            with self._lock:
-                if self._in_progress.get(saga_id) == SagaState.COMPENSATING:
-                    failed_step = step.step_id
-                    break
-
+            # V13-2 (a): handler aus snapshot, NICHT aus mutable Registry.
+            # V13-2 (c): Step wird trotzdem ausgefuehrt wenn Cancel waehrend
+            #            handler-call kommt — Step-Completion wird in
+            #            completed_steps registriert + compensation in reverse.
             try:
-                handler = self._handlers[step.phase]
+                handler = handlers_snapshot[step.phase]
                 _ = handler(step)
                 completed_steps.append(step.step_id)
             except Exception as exc:  # noqa: BLE001 — aggregate any handler error
@@ -328,8 +358,16 @@ class KPMSagaOrchestrator:
                 )
                 break
 
-        # Wenn Step-Failure: Compensation in reverse-order
-        if failed_step is not None:
+            # Cancel-Check NACH Step-Completion (V13-2 (c)):
+            # Step der gerade SUCCEEDED nach cancel-signal ist Teil von
+            # completed_steps und wird bei Compensation rueckgaengig gemacht.
+            with self._lock:
+                if self._in_progress.get(saga_id) == SagaState.COMPENSATING:
+                    cancellation_triggered = True
+                    break
+
+        # Wenn Step-Failure ODER Cancellation: Compensation in reverse-order
+        if failed_step is not None or cancellation_triggered:
             with self._lock:
                 self._in_progress[saga_id] = SagaState.COMPENSATING
 
@@ -343,7 +381,8 @@ class KPMSagaOrchestrator:
                 if step_obj is None:
                     continue  # defensive — sollte nicht passieren
 
-                comp_fn = self._compensators.get(step_obj.phase)
+                # V13-2 (a): compensator aus snapshot, NICHT aus mutable Registry
+                comp_fn = compensators_snapshot.get(step_obj.phase)
                 if comp_fn is None:
                     # Keine Compensation registriert — als no-op loggen
                     compensation_log.append(

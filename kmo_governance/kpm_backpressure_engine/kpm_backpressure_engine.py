@@ -192,7 +192,21 @@ class KPMBackpressureEngine:
         history_window: int = 60,
         elevated_threshold_pct: float = 70.0,
         blocked_threshold_pct: float = 95.0,
+        max_decisions_history: int = 10000,
     ) -> None:
+        """Constructor with V13-Patch P-V13-1 unbounded-history-Fix.
+
+        Pre-Conditions:
+            max_orders_per_second > 0.
+            max_notional_per_minute > 0.
+            history_window > 0.
+            0 <= elevated_threshold_pct < blocked_threshold_pct <= 100.
+            max_decisions_history >= 1 (V13-1: bounded audit-trail to prevent OOM).
+
+        Post-Conditions:
+            self._decisions ist deque mit maxlen=max_decisions_history (FIFO eviction).
+            Aelteste Decisions werden bei Ueberlauf automatisch evicted.
+        """
         if max_orders_per_second <= 0:
             raise ValueError("max_orders_per_second must be positive")
         if max_notional_per_minute <= 0:
@@ -211,12 +225,17 @@ class KPMBackpressureEngine:
             raise ValueError(
                 "require elevated_threshold_pct < blocked_threshold_pct"
             )
+        if max_decisions_history < 1:
+            raise ValueError(
+                f"max_decisions_history must be >= 1: {max_decisions_history}"
+            )
 
         self._max_orders_per_second = float(max_orders_per_second)
         self._max_notional_per_minute = float(max_notional_per_minute)
         self._history_window = int(history_window)
         self._elevated_pct = float(elevated_threshold_pct)
         self._blocked_pct = float(blocked_threshold_pct)
+        self._max_decisions_history = int(max_decisions_history)
 
         # Global rolling buffer of all samples (across all strategies)
         self._samples_global: deque[OrderFlowSample] = deque(maxlen=history_window)
@@ -232,8 +251,10 @@ class KPMBackpressureEngine:
             FlowState, Callable[[float], ThrottleAction]
         ] = {}
 
-        # Audit-Trail
-        self._decisions: list[BackpressureDecision] = []
+        # Audit-Trail (V13-1: bounded deque statt unbounded list, Anti-OOM)
+        self._decisions: deque[BackpressureDecision] = deque(
+            maxlen=self._max_decisions_history
+        )
 
         self._lock = threading.RLock()
 

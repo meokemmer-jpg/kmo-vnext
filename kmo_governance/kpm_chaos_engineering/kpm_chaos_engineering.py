@@ -30,6 +30,7 @@ import random
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
@@ -163,20 +164,40 @@ class KPMChaosEngineering:
         self,
         default_severity: FaultSeverity = FaultSeverity.MINOR,
         max_concurrent_chaos: int = 1,
+        max_outcomes_history: int = 10000,
     ) -> None:
+        """Constructor with V13-Patches P-V13-3 (Anti-OOM + Race-Schutz).
+
+        Pre-Conditions:
+            default_severity: FaultSeverity (Default fuer inject_random).
+            max_concurrent_chaos >= 1 (limitiert parallele Injections).
+            max_outcomes_history >= 1 (V13-3: bounded audit-trail to prevent OOM).
+
+        Post-Conditions:
+            self._outcomes ist deque mit maxlen=max_outcomes_history.
+            Aelteste Outcomes werden bei Ueberlauf automatisch evicted.
+        """
         if not isinstance(default_severity, FaultSeverity):
             raise TypeError("default_severity must be FaultSeverity")
         if max_concurrent_chaos < 1:
             raise ValueError("max_concurrent_chaos must be >= 1")
+        if max_outcomes_history < 1:
+            raise ValueError(
+                f"max_outcomes_history must be >= 1: {max_outcomes_history}"
+            )
 
         self.default_severity = default_severity
         self.max_concurrent_chaos = int(max_concurrent_chaos)
+        self.max_outcomes_history = int(max_outcomes_history)
 
         self._lock = threading.RLock()
         self._strategies: dict[
             str, Callable[[ChaosScenario], ChaosOutcome]
         ] = {}
-        self._outcomes: list[ChaosOutcome] = []
+        # V13-3 (Gemini #3): bounded deque statt unbounded list, Anti-OOM
+        self._outcomes: deque[ChaosOutcome] = deque(
+            maxlen=self.max_outcomes_history
+        )
         self._scenarios_by_outcome: dict[str, ChaosScenario] = {}
         self._paused: bool = False
         self._active_chaos_count: int = 0
@@ -191,15 +212,39 @@ class KPMChaosEngineering:
     ) -> None:
         """Bind a fault handler to a strategy_id.
 
-        Handler signature: (ChaosScenario) -> ChaosOutcome.
-        Handler is responsible for simulating the fault impact and producing
-        a ChaosOutcome with measured recovery_time + pnl_impact.
+        V13-3 (Codex r4+p7): Race-Schutz gegen mid-injection-replace.
+            Wenn _active_chaos_count > 0 UND strategy_id BEREITS registriert ist,
+            raise RuntimeError. Verhindert dass laufende Injection den Handler
+            ohne Versions-Audit unter sich austauscht. Neue strategy_id darf
+            jederzeit registriert werden (auch waehrend laufender Injections),
+            da das keinen aktiven Handler-Pfad invalidiert.
+
+        Pre:
+            strategy_id non-empty.
+            fault_handler_fn callable.
+            Wenn aktive Injection laeuft, darf NICHT existing strategy_id
+            ueberschrieben werden.
+
+        Post:
+            Handler signature: (ChaosScenario) -> ChaosOutcome.
+            Handler is responsible for simulating the fault impact and producing
+            a ChaosOutcome with measured recovery_time + pnl_impact.
         """
         if not strategy_id:
             raise ValueError("strategy_id must be non-empty")
         if not callable(fault_handler_fn):
             raise TypeError("fault_handler_fn must be callable")
         with self._lock:
+            # V13-3: mid-injection-replace nur fuer existing Strategy verbieten.
+            if (
+                self._active_chaos_count > 0
+                and strategy_id in self._strategies
+            ):
+                raise RuntimeError(
+                    f"cannot replace handler for strategy '{strategy_id}' "
+                    f"while {self._active_chaos_count} chaos injection(s) active "
+                    f"(V13-3 race-protection)"
+                )
             self._strategies[strategy_id] = fault_handler_fn
 
     # -------------- Injection --------------

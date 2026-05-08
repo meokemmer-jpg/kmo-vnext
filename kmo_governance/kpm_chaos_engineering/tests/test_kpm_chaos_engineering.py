@@ -599,4 +599,99 @@ def test_handler_returning_non_outcome_becomes_failure() -> None:
     assert any("non-ChaosOutcome" in obs for obs in outcome.observations)
 
 
+# -------------- P-V13-3: Race-Schutz + Bounded outcomes --------------
+
+
+def test_register_strategy_during_active_chaos_raises() -> None:
+    """V13-3: Mid-injection-replace einer EXISTING strategy_id raises RuntimeError.
+
+    Block-Handler haelt _active_chaos_count > 0, parallel-Thread versucht
+    Handler von SCHON registrierter strategy_id zu ueberschreiben.
+    Erwartung: RuntimeError + alter Handler bleibt aktiv.
+    """
+    chaos = KPMChaosEngineering()
+    enter_evt = threading.Event()
+    release_evt = threading.Event()
+
+    def blocking_handler(scenario: ChaosScenario) -> ChaosOutcome:
+        enter_evt.set()
+        release_evt.wait(timeout=5.0)
+        return ChaosOutcome(
+            scenario_id=scenario.scenario_id,
+            success=True,
+            actual_recovery_s=0.0,
+            pnl_impact=0.0,
+            observations=("blocked",),
+            timestamp=time.time(),
+        )
+
+    chaos.register_strategy("strat_v13_3", blocking_handler)
+
+    inject_done = threading.Event()
+    inject_outcome: list[ChaosOutcome] = []
+
+    def runner_inject() -> None:
+        try:
+            outcome = chaos.inject(_build_scenario(
+                sid="v13-3-block",
+                target="strat_v13_3",
+            ))
+            inject_outcome.append(outcome)
+        finally:
+            inject_done.set()
+
+    t = threading.Thread(target=runner_inject)
+    t.start()
+
+    # Wait for injection to enter handler (active_chaos_count > 0)
+    assert enter_evt.wait(timeout=5.0), "blocking handler did not enter"
+    assert chaos.active_chaos_count == 1
+
+    # V13-3: Re-register EXISTING strategy_id while active -> RuntimeError
+    with pytest.raises(RuntimeError, match="while.*chaos injection"):
+        chaos.register_strategy("strat_v13_3", _success_handler)
+
+    # V13-3: Register NEW strategy_id while active -> ALLOWED
+    chaos.register_strategy("strat_v13_3_new", _success_handler)
+    assert "strat_v13_3_new" in chaos.registered_strategies
+
+    # Release blocking injection
+    release_evt.set()
+    inject_done.wait(timeout=5.0)
+    t.join(timeout=5.0)
+
+    assert chaos.active_chaos_count == 0
+    assert len(inject_outcome) == 1
+    assert inject_outcome[0].success is True
+
+
+def test_outcomes_bounded_at_maxlen() -> None:
+    """V13-3: _outcomes deque ist bounded auf max_outcomes_history."""
+    chaos = KPMChaosEngineering(max_outcomes_history=5)
+    chaos.register_strategy("kelly_0.4", _success_handler)
+
+    # 10 injects -> 10 outcomes erzeugt, aber maxlen=5 -> nur letzte 5
+    for i in range(10):
+        chaos.inject(_build_scenario(sid=f"v13-3-{i}"))
+
+    outcomes = chaos.get_outcomes()
+    assert len(outcomes) == 5
+    # Letzte 5 (5..9) bleiben
+    ids = [o.scenario_id for o in outcomes]
+    assert ids == ["v13-3-5", "v13-3-6", "v13-3-7", "v13-3-8", "v13-3-9"]
+
+
+def test_max_outcomes_history_validation() -> None:
+    """V13-3: max_outcomes_history Pre-Condition >= 1."""
+    # OK
+    KPMChaosEngineering(max_outcomes_history=1)
+    KPMChaosEngineering(max_outcomes_history=10000)
+
+    # NOT OK
+    with pytest.raises(ValueError, match="max_outcomes_history"):
+        KPMChaosEngineering(max_outcomes_history=0)
+    with pytest.raises(ValueError, match="max_outcomes_history"):
+        KPMChaosEngineering(max_outcomes_history=-1)
+
+
 # CRUX-MK

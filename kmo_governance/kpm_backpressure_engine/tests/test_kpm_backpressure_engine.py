@@ -467,4 +467,62 @@ def test_throttle_action_validation() -> None:
         ThrottleAction("ALLOW", 0.0, "x", 0.0)
 
 
+# ---------- P-V13-1: max_decisions_history (Anti-OOM Bounded Audit-Trail) ----------
+
+
+def test_decisions_bounded_at_maxlen() -> None:
+    """V13-1: _decisions deque ist bounded auf max_decisions_history."""
+    eng = KPMBackpressureEngine(
+        max_orders_per_second=100.0,
+        max_notional_per_minute=1_000_000.0,
+        history_window=10,
+        max_decisions_history=5,  # bounded auf 5
+    )
+    eng.record_order("strat-a", "AAPL", 100.0)
+    # 10 evaluate-Calls -> 10 Decisions, aber maxlen=5
+    for _ in range(10):
+        eng.evaluate()
+
+    decisions = eng.get_decisions()
+    # Bounded: nur letzte 5 erhalten
+    assert len(decisions) == 5
+
+
+def test_decisions_evicts_oldest_when_full() -> None:
+    """V13-1: FIFO-Eviction (aelteste Decision rausgeworfen wenn voll)."""
+    eng = KPMBackpressureEngine(
+        max_orders_per_second=100.0,
+        max_notional_per_minute=1_000_000.0,
+        history_window=10,
+        max_decisions_history=3,
+    )
+    eng.record_order("strat-a", "AAPL", 100.0)
+    # Erzeuge 5 Decisions, deque haelt nur 3
+    timestamps = []
+    for _ in range(5):
+        d = eng.evaluate()
+        timestamps.append(d.timestamp)
+        time.sleep(0.001)  # kleine Differenz fuer eindeutige Timestamps
+
+    decisions = eng.get_decisions()
+    assert len(decisions) == 3
+    # Aelteste 2 evicted -> erstes Element entspricht timestamps[2]
+    assert decisions[0].timestamp == timestamps[2]
+    # Letztes Element entspricht timestamps[4]
+    assert decisions[-1].timestamp == timestamps[4]
+
+
+def test_max_decisions_history_validation() -> None:
+    """V13-1: max_decisions_history Pre-Condition >= 1."""
+    # Happy path
+    KPMBackpressureEngine(10.0, 1_000_000.0, max_decisions_history=1)
+    KPMBackpressureEngine(10.0, 1_000_000.0, max_decisions_history=10000)
+
+    # Pre-condition violations
+    with pytest.raises(ValueError):
+        KPMBackpressureEngine(10.0, 1_000_000.0, max_decisions_history=0)
+    with pytest.raises(ValueError):
+        KPMBackpressureEngine(10.0, 1_000_000.0, max_decisions_history=-1)
+
+
 # CRUX-MK

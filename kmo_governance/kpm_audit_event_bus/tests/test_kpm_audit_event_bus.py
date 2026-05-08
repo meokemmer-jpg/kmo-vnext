@@ -387,4 +387,74 @@ def test_query_invalid_filter_types():
         bus.query(compliance_tag="kyc")  # type: ignore
 
 
+# -------------- P-V13-4: Metadata-Cap + Silent-Drops-Counter --------------
+
+
+def test_metadata_size_limit_enforced():
+    """V13-4: metadata > max_metadata_bytes raises ValueError."""
+    bus = KPMAuditEventBus(max_metadata_bytes=64)
+
+    # Small metadata OK
+    small_meta = (("k", "v"),)
+    bus.publish("s", TradeEventType.BUY, "I1", 10, 100, metadata=small_meta)
+
+    # Big metadata > 64 bytes -> ValueError
+    huge_value = "x" * 200
+    big_meta = (("key", huge_value),)
+    with pytest.raises(ValueError, match="metadata size.*exceeds"):
+        bus.publish(
+            "s", TradeEventType.BUY, "I1", 10, 100, metadata=big_meta
+        )
+
+    # max_metadata_bytes pre-condition < 1
+    with pytest.raises(ValueError, match="max_metadata_bytes"):
+        KPMAuditEventBus(max_metadata_bytes=0)
+    with pytest.raises(ValueError, match="max_metadata_bytes"):
+        KPMAuditEventBus(max_metadata_bytes=-5)
+
+
+def test_silent_drops_counter_increments():
+    """V13-4: silent_drops_count incrementiert bei deque-maxlen-eviction."""
+    # Mock DEFAULT_MAX_SIZE for testbarkeit via class-monkey-patch
+    bus = KPMAuditEventBus()
+    # Set deque maxlen to 3 fuer determinitistischen Test
+    from collections import deque as _deque
+
+    bus._events = _deque(maxlen=3)
+
+    # Initial: keine drops
+    assert bus.get_stats()["silent_drops_count"] == 0
+
+    # 3 events -> deque voll, aber NOCH keine drops
+    for i in range(3):
+        bus.publish("s", TradeEventType.BUY, f"I{i}", 10, 100)
+    assert bus.get_stats()["silent_drops_count"] == 0
+    assert bus.get_stats()["current_count"] == 3
+
+    # 4. event -> deque schon voll vor append -> 1 silent drop
+    bus.publish("s", TradeEventType.BUY, "I4", 10, 100)
+    assert bus.get_stats()["silent_drops_count"] == 1
+    assert bus.get_stats()["current_count"] == 3
+
+    # 5. + 6. event -> 3 drops total
+    bus.publish("s", TradeEventType.BUY, "I5", 10, 100)
+    bus.publish("s", TradeEventType.BUY, "I6", 10, 100)
+    assert bus.get_stats()["silent_drops_count"] == 3
+    assert bus.get_stats()["current_count"] == 3
+
+
+def test_silent_drops_in_stats():
+    """V13-4: silent_drops_count erscheint in get_stats()-Snapshot."""
+    bus = KPMAuditEventBus()
+    stats = bus.get_stats()
+    # Pflicht-Feld vorhanden
+    assert "silent_drops_count" in stats
+    assert stats["silent_drops_count"] == 0
+    assert isinstance(stats["silent_drops_count"], int)
+
+    # Snapshot-Isolation: dict-Mutation veraendert Bus-Internal nicht
+    stats["silent_drops_count"] = 999
+    assert bus.get_stats()["silent_drops_count"] == 0
+
+
 # CRUX-MK

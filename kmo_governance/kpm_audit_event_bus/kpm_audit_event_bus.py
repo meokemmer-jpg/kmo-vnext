@@ -126,7 +126,20 @@ class KPMAuditEventBus:
         self,
         retention_window_h: float = 168.0,
         compliance_required: Optional[set] = None,
+        max_metadata_bytes: int = 4096,
     ) -> None:
+        """Constructor with V13-Patch P-V13-4 (Metadata-Cap + Silent-Drops-Counter).
+
+        Pre-Conditions:
+            retention_window_h > 0.
+            compliance_required ist set[ComplianceTag] oder None.
+            max_metadata_bytes >= 1 (V13-4: Anti-Memory-Bloat via metadata size cap).
+
+        Post-Conditions:
+            self._silent_drops_count tracks Anzahl Events die durch deque-maxlen
+            eviction ueberschrieben wurden. Erscheint in get_stats() als
+            "silent_drops_count".
+        """
         if retention_window_h <= 0:
             raise ValueError("retention_window_h must be > 0")
         if compliance_required is not None:
@@ -135,10 +148,15 @@ class KPMAuditEventBus:
                     raise TypeError(
                         "compliance_required entries must be ComplianceTag"
                     )
+        if max_metadata_bytes < 1:
+            raise ValueError(
+                f"max_metadata_bytes must be >= 1: {max_metadata_bytes}"
+            )
         self.retention_window_h = retention_window_h
         self.compliance_required: frozenset = (
             frozenset(compliance_required) if compliance_required else frozenset()
         )
+        self.max_metadata_bytes = int(max_metadata_bytes)
         self._events: deque = deque(maxlen=self.DEFAULT_MAX_SIZE)
         self._stats: dict = {
             "total_published": 0,
@@ -146,6 +164,8 @@ class KPMAuditEventBus:
             "by_event_type": {t.value: 0 for t in TradeEventType},
             "by_compliance_tag": {t.value: 0 for t in ComplianceTag},
         }
+        # V13-4: silent-drops counter (deque-maxlen evictions waehrend publish)
+        self._silent_drops_count: int = 0
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ publish
@@ -183,6 +203,14 @@ class KPMAuditEventBus:
             tuple(metadata) if metadata else ()
         )
 
+        # V13-4: Metadata-Size-Cap (Anti-Memory-Bloat)
+        meta_size = len(repr(normalized_metadata))
+        if meta_size > self.max_metadata_bytes:
+            raise ValueError(
+                f"metadata size {meta_size} exceeds max_metadata_bytes "
+                f"{self.max_metadata_bytes} (V13-4 cap)"
+            )
+
         event = TradeAuditEvent(
             event_id=str(uuid.uuid4()),
             strategy_id=strategy_id,
@@ -196,6 +224,10 @@ class KPMAuditEventBus:
         )
 
         with self._lock:
+            # V13-4: Silent-Drop-Detection — wenn deque schon voll ist, fuehrt
+            # append zu eviction des aeltesten Events (FIFO). Counter inkrementieren.
+            if len(self._events) == self._events.maxlen:
+                self._silent_drops_count += 1
             self._events.append(event)
             self._stats["total_published"] += 1
             self._stats["by_event_type"][event_type.value] += 1
@@ -263,8 +295,11 @@ class KPMAuditEventBus:
     def get_stats(self) -> dict:
         """Snapshot der laufenden Statistik (deep-copy).
 
+        V13-4: dict enthaelt silent_drops_count (Anzahl deque-maxlen Evictions).
+
         Post: gibt dict mit total_published, total_purged, by_event_type, by_compliance_tag,
-              current_count zurueck. Aenderungen am Rueckgabe-dict beeinflussen nicht den Bus.
+              current_count, silent_drops_count zurueck. Aenderungen am Rueckgabe-dict
+              beeinflussen nicht den Bus.
         """
         with self._lock:
             return {
@@ -274,6 +309,7 @@ class KPMAuditEventBus:
                 "by_compliance_tag": dict(self._stats["by_compliance_tag"]),
                 "current_count": len(self._events),
                 "retention_window_h": self.retention_window_h,
+                "silent_drops_count": self._silent_drops_count,
             }
 
     # ------------------------------------------------------------- cleanup_old
