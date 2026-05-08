@@ -336,6 +336,52 @@ class KPMTradeAdmissionPipeline:
             timestamp=time.time(),
         )
 
+    def _release_lock(
+        self,
+        instrument_id: str,
+        side: PositionSide,
+    ) -> dict:
+        """Internal: Idempotent token-validated lock-release.
+
+        P-V15-1 Cleanup-Atomicity: prueft self._lease_token VOR release(),
+        nullt VOR der release-Call (idempotent / no double-release-race),
+        und propagiert release-result-status als dict zurueck. Call-Sites
+        koennen damit success=False/cleanup_failed setzen.
+
+        Pre-Conditions:
+            instrument_id, side passend zum aktiven Lease.
+
+        Post-Conditions:
+            self._lease_token wird auf None gesetzt VOR release() Call
+            (idempotent: zweite Call ist no-op released=True+reason=no_lease).
+            Returns dict {"released": bool, "reason": str}:
+              * {"released": True,  "reason": "no_lease"}      wenn kein Token
+              * {"released": True,  "reason": "released"}      bei Success
+              * {"released": False, "reason": <release-reason>} bei Failure
+        """
+        token = self._lease_token
+        if token is None:
+            return {"released": True, "reason": "no_lease"}
+        # Idempotent: token VOR release() nullen, damit zweiter Aufruf
+        # innerhalb des gleichen Pipeline-Runs (z.B. Exception-Pfad nach
+        # Stage-9-Release) als no-op laeuft und keine Race-Doppel-Release
+        # auftritt.
+        self._lease_token = None
+        try:
+            release_result = self.lock_manager.release(
+                instrument_id=instrument_id,
+                position_side=side,
+                lease_token=token,
+            )
+        except Exception as exc:
+            return {
+                "released": False,
+                "reason": f"release_exception ({type(exc).__name__}: {exc})",
+            }
+        if release_result.success:
+            return {"released": True, "reason": "released"}
+        return {"released": False, "reason": release_result.reason}
+
     def submit_trade(
         self,
         strategy_id: str,
@@ -393,7 +439,13 @@ class KPMTradeAdmissionPipeline:
         decision_path: list = []
         active_strategy_id = strategy_id
         flag_id = f"strategy_{strategy_id}"
-        lease_token: Optional[str] = None
+        # P-V15-1: lease_token lebt als instance-Attribut auf der Pipeline,
+        # damit _release_lock() (method) den State nullen kann ohne Closure.
+        # Initial: kein Lock gehalten.
+        self._lease_token: Optional[str] = None
+        # P-V15-1: cleanup_failed-Flag pro submit_trade-Run; verhindert
+        # success=True wenn release() failed.
+        cleanup_failed: bool = False
 
         # ----- Stage 1: Feature-Flag -----
         decision_path.append(STAGE_FEATURE_FLAG)
@@ -469,16 +521,7 @@ class KPMTradeAdmissionPipeline:
                 start_monotonic=start_monotonic,
             )
         assert lock_result.lease is not None
-        lease_token = lock_result.lease.lease_token
-
-        # Hilfs-Helper: cleanup-on-error
-        def _release_lock() -> None:
-            assert lease_token is not None
-            self.lock_manager.release(
-                instrument_id=instrument_id,
-                position_side=side,
-                lease_token=lease_token,
-            )
+        self._lease_token = lock_result.lease.lease_token
 
         try:
             # ----- Stage 5: Failover-Routing -----
@@ -522,14 +565,20 @@ class KPMTradeAdmissionPipeline:
             saga_outcome = self.saga.execute_saga(steps)
             saga_id = saga_outcome.saga_id
             if saga_outcome.state != SagaState.COMPLETED:
-                _release_lock()
+                # P-V15-1: status-aware cleanup. Bei release-failure cleanup_failed flaggen.
+                rel = self._release_lock(instrument_id, side)
+                if not rel["released"]:
+                    cleanup_failed = True
+                reason = (
+                    f"saga_failed (state={saga_outcome.state.value}, "
+                    f"failed_step={saga_outcome.failed_step})"
+                )
+                if cleanup_failed:
+                    reason += f"; cleanup_failed ({rel['reason']})"
                 return self._build_result(
                     success=False,
                     decision_path=decision_path,
-                    reason=(
-                        f"saga_failed (state={saga_outcome.state.value}, "
-                        f"failed_step={saga_outcome.failed_step})"
-                    ),
+                    reason=reason,
                     active_strategy_id=active_strategy_id,
                     start_monotonic=start_monotonic,
                     saga_id=saga_id,
@@ -574,8 +623,21 @@ class KPMTradeAdmissionPipeline:
 
             # ----- Stage 9: Lock-Release -----
             decision_path.append(STAGE_LOCK_RELEASE)
-            _release_lock()
-            lease_token = None  # markiert dass Release schon erfolgte
+            # P-V15-1: status-aware Release. Bei Failure: success=False mit cleanup_failed-Reason.
+            rel = self._release_lock(instrument_id, side)
+            if not rel["released"]:
+                cleanup_failed = True
+
+            if cleanup_failed:
+                return self._build_result(
+                    success=False,
+                    decision_path=decision_path,
+                    reason=f"cleanup_failed ({rel['reason']})",
+                    active_strategy_id=active_strategy_id,
+                    start_monotonic=start_monotonic,
+                    audit_event_id=audit_event.event_id,
+                    saga_id=saga_id,
+                )
 
             return self._build_result(
                 success=True,
@@ -590,16 +652,19 @@ class KPMTradeAdmissionPipeline:
                 saga_id=saga_id,
             )
         except Exception as exc:
-            # Defensive: bei UNEXPECTED-Exception Lock immer releasen.
-            if lease_token is not None:
-                try:
-                    _release_lock()
-                except Exception:
-                    pass  # secondary error; original exc weiter
+            # P-V15-1: Defensive cleanup auf Unexpected-Exception. _release_lock
+            # ist idempotent (nullt token VOR release-Call), Double-Release ist
+            # damit ausgeschlossen.
+            rel = self._release_lock(instrument_id, side)
+            if not rel["released"]:
+                cleanup_failed = True
+            reason = f"pipeline_exception ({type(exc).__name__}: {exc})"
+            if cleanup_failed:
+                reason += f"; cleanup_failed ({rel['reason']})"
             return self._build_result(
                 success=False,
                 decision_path=decision_path,
-                reason=f"pipeline_exception ({type(exc).__name__}: {exc})",
+                reason=reason,
                 active_strategy_id=active_strategy_id,
                 start_monotonic=start_monotonic,
             )

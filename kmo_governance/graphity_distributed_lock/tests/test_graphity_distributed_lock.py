@@ -533,6 +533,61 @@ class TestFrozen(unittest.TestCase):
             r.success = False  # type: ignore[misc]
 
 
+class TestMaxActiveLeases(unittest.TestCase):
+    """P-V15-4: Anti-OOM Auto-Sweep + max_active_leases (Cross-LLM-V15)."""
+
+    def test_max_active_leases_enforced(self) -> None:
+        """max_active_leases voll + alle aktiv -> RuntimeError beim NEUEN acquire."""
+        # Cap=3, alle Leases mit langer TTL (nicht expired)
+        mgr = GraphityDistributedEditLock(
+            default_ttl_s=3600.0, max_active_leases=3
+        )
+        # 3 disjunkte Locks belegen (full)
+        r1 = mgr.acquire("book_a", "ch_1", EditScope.CHAPTER, "auth_1")
+        r2 = mgr.acquire("book_a", "ch_2", EditScope.CHAPTER, "auth_2")
+        r3 = mgr.acquire("book_a", "ch_3", EditScope.CHAPTER, "auth_3")
+        self.assertTrue(r1.success)
+        self.assertTrue(r2.success)
+        self.assertTrue(r3.success)
+
+        # 4. acquire fuer NEUEN Lock (Cap voll, kein Expired-Lease)
+        with self.assertRaises(RuntimeError) as ctx:
+            mgr.acquire("book_a", "ch_4", EditScope.CHAPTER, "auth_4")
+        self.assertIn("max_active_leases exceeded", str(ctx.exception))
+
+        # Re-acquire auf existierendes (held) Lock soll weiterhin success=False
+        # liefern (kein RuntimeError, nur lock-conflict).
+        r_dup = mgr.acquire("book_a", "ch_1", EditScope.CHAPTER, "another_auth")
+        self.assertFalse(r_dup.success)
+        self.assertEqual(r_dup.conflict_holder, "auth_1")
+
+    def test_acquire_triggers_global_sweep_when_full(self) -> None:
+        """Cap voll mit expired Leases -> Auto-Sweep + neuer acquire success."""
+        mgr = GraphityDistributedEditLock(
+            default_ttl_s=0.05, max_active_leases=3  # 50ms TTL
+        )
+        # 3 Leases mit kurzer TTL
+        mgr.acquire("book_a", "ch_1", EditScope.CHAPTER, "auth_1")
+        mgr.acquire("book_a", "ch_2", EditScope.CHAPTER, "auth_2")
+        mgr.acquire("book_a", "ch_3", EditScope.CHAPTER, "auth_3")
+        self.assertEqual(len(mgr._leases), 3)
+
+        # Warten bis alle expired sind
+        time.sleep(0.10)
+
+        # Neuer acquire mit langer TTL -> triggert Auto-Sweep -> success
+        r4 = mgr.acquire(
+            "book_a", "ch_4", EditScope.CHAPTER, "auth_4", ttl_s=3600.0
+        )
+        self.assertTrue(r4.success)
+        # Auto-Sweep hat alte Leases entfernt; jetzt nur noch 1 aktive
+        self.assertEqual(len(mgr._leases), 1)
+        self.assertEqual(
+            mgr._leases[("book_a", "ch_4", EditScope.CHAPTER)].holder_author_id,
+            "auth_4",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 

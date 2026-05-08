@@ -133,25 +133,38 @@ class CapeFamilienAuditBus:
 
     DEFAULT_RETENTION_HOURS = 8760.0  # 1 Jahr GDPR-Familien-Default
     DEFAULT_MAX_SIZE = 1_000  # Tighter cap fuer Familien (kleineres Volumen vs Trading)
+    DEFAULT_MAX_METADATA_BYTES = 4096  # P-V15-3: Cap fuer metadata payload-size
+    DEFAULT_MAX_ROLE_CARDINALITY = 10000  # P-V15-3: Cap fuer by_family_member_role
 
     def __init__(
         self,
         retention_window_h: float = 8760.0,
         compliance_required: Optional[set] = None,
+        max_metadata_bytes: int = DEFAULT_MAX_METADATA_BYTES,
+        max_role_cardinality: int = DEFAULT_MAX_ROLE_CARDINALITY,
     ) -> None:
         """Constructor.
 
         Pre-Conditions:
             retention_window_h > 0.
             compliance_required ist set[ComplianceTag] oder None.
+            max_metadata_bytes > 0 (P-V15-3: limit metadata payload-size,
+                                    Default 4096 Bytes via repr()-Length).
+            max_role_cardinality > 0 (P-V15-3: limit unique family_member_role
+                                      Eintraege in _stats, Default 10000).
 
         Post-Conditions:
             self._events ist deque(maxlen=DEFAULT_MAX_SIZE).
             self._stats initialisiert mit by_decision_type + by_compliance_tag (alle 0).
             self._lock ist RLock (thread-safe).
+            self._silent_drops_count zaehlt by_family_member_role-Overflow-Drops.
         """
         if retention_window_h <= 0:
             raise ValueError("retention_window_h must be > 0")
+        if max_metadata_bytes <= 0:
+            raise ValueError("max_metadata_bytes must be > 0")
+        if max_role_cardinality <= 0:
+            raise ValueError("max_role_cardinality must be > 0")
         if compliance_required is not None:
             for tag in compliance_required:
                 if not isinstance(tag, ComplianceTag):
@@ -159,6 +172,8 @@ class CapeFamilienAuditBus:
                         "compliance_required entries must be ComplianceTag"
                     )
         self.retention_window_h = retention_window_h
+        self.max_metadata_bytes = int(max_metadata_bytes)
+        self.max_role_cardinality = int(max_role_cardinality)
         self.compliance_required: frozenset = (
             frozenset(compliance_required) if compliance_required else frozenset()
         )
@@ -168,8 +183,10 @@ class CapeFamilienAuditBus:
             "total_purged": 0,
             "by_decision_type": {t.value: 0 for t in FamilienDecisionType},
             "by_compliance_tag": {t.value: 0 for t in ComplianceTag},
-            "by_family_member_role": {},  # dynamisch wachsend
+            "by_family_member_role": {},  # bounded auf max_role_cardinality
         }
+        # P-V15-3: silent-drop-counter fuer by_family_member_role-Overflow.
+        self._silent_drops_count: int = 0
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ publish
@@ -199,6 +216,13 @@ class CapeFamilienAuditBus:
         normalized_tags = frozenset(compliance_tags) if compliance_tags else frozenset()
         normalized_metadata = tuple(metadata) if metadata else ()
 
+        # P-V15-3: enforce metadata size-cap (repr-length als pragmatische Naeherung).
+        if len(repr(normalized_metadata)) > self.max_metadata_bytes:
+            raise ValueError(
+                f"metadata exceeds max_metadata_bytes "
+                f"({len(repr(normalized_metadata))} > {self.max_metadata_bytes})"
+            )
+
         event = FamilienAuditEvent(
             event_id=str(uuid.uuid4()),
             decision_type=decision_type,
@@ -215,9 +239,16 @@ class CapeFamilienAuditBus:
             self._stats["by_decision_type"][decision_type.value] += 1
             for tag in normalized_tags:
                 self._stats["by_compliance_tag"][tag.value] += 1
-            self._stats["by_family_member_role"][family_member_role] = (
-                self._stats["by_family_member_role"].get(family_member_role, 0) + 1
-            )
+            # P-V15-3: bounded by_family_member_role. Bei Overflow-Versuch
+            # einer NEUEN role: drop-count++ (silent-drop, kein Crash; Event
+            # wird trotzdem gespeichert, nur die Stats sind bounded).
+            roles = self._stats["by_family_member_role"]
+            if family_member_role in roles:
+                roles[family_member_role] += 1
+            elif len(roles) < self.max_role_cardinality:
+                roles[family_member_role] = 1
+            else:
+                self._silent_drops_count += 1
 
         return event
 
@@ -301,6 +332,7 @@ class CapeFamilienAuditBus:
                 "by_decision_type": dict(self._stats["by_decision_type"]),
                 "by_compliance_tag": dict(self._stats["by_compliance_tag"]),
                 "by_family_member_role": dict(self._stats["by_family_member_role"]),
+                "silent_drops_count": self._silent_drops_count,
                 "current_count": len(self._events),
                 "retention_window_h": self.retention_window_h,
             }

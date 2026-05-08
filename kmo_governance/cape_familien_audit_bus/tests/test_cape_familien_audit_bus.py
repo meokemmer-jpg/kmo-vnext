@@ -479,4 +479,90 @@ def test_query_invalid_filter_types():
         bus.query(compliance_tag="gdpr")  # type: ignore
 
 
+# ---------------------------------------------------------------------------
+# P-V15-3: Anti-Stats-Leak Tests (Cross-LLM-V15 Konsens-Patch)
+# ---------------------------------------------------------------------------
+
+
+def test_metadata_size_limit_enforced():
+    """P-V15-3: metadata > max_metadata_bytes -> ValueError."""
+    bus = CapeFamilienAuditBus(max_metadata_bytes=200)
+    # kleines metadata -> OK
+    bus.publish(
+        FamilienDecisionType.DECISION_FAMILIAL,
+        "test_member_a",
+        "test_ctx",
+        metadata=(("k", "v"),),
+    )
+    # grosses metadata -> raise
+    big_metadata = tuple(
+        (f"key_{i}", "x" * 100) for i in range(20)
+    )
+    with pytest.raises(ValueError, match="metadata exceeds max_metadata_bytes"):
+        bus.publish(
+            FamilienDecisionType.DECISION_FAMILIAL,
+            "test_member_a",
+            "test_ctx",
+            metadata=big_metadata,
+        )
+
+
+def test_role_cardinality_bounded():
+    """P-V15-3: by_family_member_role waechst nur bis max_role_cardinality."""
+    bus = CapeFamilienAuditBus(max_role_cardinality=5)
+    # 5 distinct roles -> alle drin
+    for i in range(5):
+        bus.publish(
+            FamilienDecisionType.DECISION_FAMILIAL,
+            f"member_{i}",
+            "ctx",
+        )
+    stats = bus.get_stats()
+    assert len(stats["by_family_member_role"]) == 5
+    assert stats["silent_drops_count"] == 0
+
+    # 5 weitere distinct roles -> alle silent dropped
+    for i in range(5, 10):
+        bus.publish(
+            FamilienDecisionType.DECISION_FAMILIAL,
+            f"member_{i}",
+            "ctx",
+        )
+    stats = bus.get_stats()
+    # by_family_member_role bleibt bei 5 (NEUE roles dropped)
+    assert len(stats["by_family_member_role"]) == 5
+    # silent_drops_count = 5 (member_5 .. member_9)
+    assert stats["silent_drops_count"] == 5
+
+    # Re-publish einer EXISTIERENDEN role -> count++ (kein drop)
+    bus.publish(
+        FamilienDecisionType.DECISION_FAMILIAL,
+        "member_0",
+        "ctx",
+    )
+    stats = bus.get_stats()
+    assert stats["by_family_member_role"]["member_0"] == 2
+    assert stats["silent_drops_count"] == 5  # unveraendert
+
+
+def test_silent_drops_count_increments_on_role_overflow():
+    """P-V15-3: silent_drops_count wird bei jedem unique-role-overflow inkrementiert."""
+    bus = CapeFamilienAuditBus(max_role_cardinality=2)
+    bus.publish(FamilienDecisionType.DECISION_FAMILIAL, "alice", "ctx")
+    bus.publish(FamilienDecisionType.DECISION_FAMILIAL, "bob", "ctx")
+    # 3. distinct role -> dropped
+    bus.publish(FamilienDecisionType.DECISION_FAMILIAL, "carol", "ctx")
+    # 4. distinct role -> dropped
+    bus.publish(FamilienDecisionType.DECISION_FAMILIAL, "dave", "ctx")
+    # 5. distinct role -> dropped
+    bus.publish(FamilienDecisionType.DECISION_FAMILIAL, "eve", "ctx")
+    stats = bus.get_stats()
+    assert stats["silent_drops_count"] == 3
+    # by_family_member_role hat nur alice, bob
+    assert set(stats["by_family_member_role"].keys()) == {"alice", "bob"}
+    # Events selbst werden weiterhin gespeichert (nicht gedropped)
+    assert stats["total_published"] == 5
+    assert stats["current_count"] == 5
+
+
 # CRUX-MK

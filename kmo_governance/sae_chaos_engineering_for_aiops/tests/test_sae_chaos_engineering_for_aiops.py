@@ -622,3 +622,53 @@ def test_register_slot_race_protection() -> None:
     proceed.set()
     t.join(timeout=5.0)
     assert chaos.active_chaos_count == 0
+
+
+# -------------- P-V15-2: Anti-OOM Eviction (Cross-LLM-V15 Konsens-Patch) --------------
+
+
+def test_scenarios_by_outcome_evicts_with_outcomes_deque() -> None:
+    """P-V15-2: Bei Deque-Overflow wird _scenarios_by_outcome ebenfalls evicted.
+
+    Vor dem Patch wuchs _scenarios_by_outcome unbounded auch wenn _outcomes
+    bereits maxlen erreicht hatte (deque-eviction loescht nur deque, nicht dict).
+    """
+    chaos = SAEChaosEngineering(max_outcomes_history=3)
+    chaos.register_slot("slot_42", "HOUSEKEEPING", _success_handler)
+
+    # 5 inject -> deque haelt nur 3 (FIFO-eviction)
+    for i in range(5):
+        chaos.inject(_build_scenario(sid=f"s-{i}"))
+
+    # _outcomes deque length = maxlen (3)
+    assert len(chaos._outcomes) == 3
+    # _scenarios_by_outcome darf nicht groesser sein als _outcomes
+    assert len(chaos._scenarios_by_outcome) == 3
+    # Aelteste 2 IDs (s-0, s-1) wurden evicted
+    assert "s-0" not in chaos._scenarios_by_outcome
+    assert "s-1" not in chaos._scenarios_by_outcome
+    # Neueste 3 IDs (s-2, s-3, s-4) sind drin
+    assert "s-2" in chaos._scenarios_by_outcome
+    assert "s-3" in chaos._scenarios_by_outcome
+    assert "s-4" in chaos._scenarios_by_outcome
+
+
+def test_long_running_inject_loop_no_dict_growth() -> None:
+    """P-V15-2: 10001 inject-calls -> _scenarios_by_outcome bleibt <= maxlen.
+
+    Stress-Test: 10000 + 1 inject mit max_outcomes_history=10000.
+    _scenarios_by_outcome darf maximal 10000 Eintraege haben.
+    """
+    chaos = SAEChaosEngineering(max_outcomes_history=10000)
+    chaos.register_slot("slot_42", "HOUSEKEEPING", _success_handler)
+
+    # 10001 inject (1 mehr als maxlen) -> 1 evicted
+    for i in range(10001):
+        chaos.inject(_build_scenario(sid=f"loop-{i}"))
+
+    assert len(chaos._outcomes) == 10000
+    assert len(chaos._scenarios_by_outcome) == 10000
+    # Aelteste ID (loop-0) ist evicted
+    assert "loop-0" not in chaos._scenarios_by_outcome
+    # Neueste ID (loop-10000) ist drin
+    assert "loop-10000" in chaos._scenarios_by_outcome

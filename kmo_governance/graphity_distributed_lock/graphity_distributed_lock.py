@@ -197,13 +197,29 @@ class GraphityDistributedEditLock:
         self,
         default_ttl_s: float = 600.0,
         sweep_interval_s: float = 60.0,
+        max_active_leases: int = 10000,
     ) -> None:
+        """Constructor.
+
+        Pre-Conditions:
+            default_ttl_s > 0.
+            sweep_interval_s > 0.
+            max_active_leases > 0 (P-V15-4: bounded _leases dict, default 10000).
+
+        Post-Conditions:
+            self._leases ist dict mit max_active_leases als Hard-Cap.
+            acquire() triggert global sweep_expired() opportunistisch
+            wenn dict-cap erreicht ist (Auto-Sweep statt OOM).
+        """
         if default_ttl_s <= 0:
             raise ValueError("default_ttl_s must be > 0")
         if sweep_interval_s <= 0:
             raise ValueError("sweep_interval_s must be > 0")
+        if max_active_leases <= 0:
+            raise ValueError("max_active_leases must be > 0")
         self._default_ttl_s = default_ttl_s
         self._sweep_interval_s = sweep_interval_s
+        self._max_active_leases = int(max_active_leases)
         self._leases: dict[tuple[str, str, EditScope], EditLease] = {}
         self._lock = threading.RLock()
 
@@ -256,6 +272,24 @@ class GraphityDistributedEditLock:
                         reason=f"lock held by {existing.holder_author_id}",
                         conflict_holder=existing.holder_author_id,
                     )
+
+            # P-V15-4: Auto-Sweep bei max_active_leases-Cap.
+            # Wenn key NICHT existing (also wir adden ein NEUES Slot-Element):
+            # bei Cap-Erreichung opportunistisch global sweep_expired().
+            # Wenn nach Sweep immer noch voll: RuntimeError.
+            if key not in self._leases and len(self._leases) >= self._max_active_leases:
+                # Inline-Sweep (lock haelt RLock, sweep_expired ist re-entrant).
+                expired_keys = [
+                    k for k, lease in self._leases.items() if lease.is_expired(now)
+                ]
+                for k in expired_keys:
+                    del self._leases[k]
+                if len(self._leases) >= self._max_active_leases:
+                    raise RuntimeError(
+                        f"max_active_leases exceeded "
+                        f"({len(self._leases)} >= {self._max_active_leases})"
+                    )
+
             lease = EditLease(
                 book_id=book_id,
                 chapter_id=chapter_id,

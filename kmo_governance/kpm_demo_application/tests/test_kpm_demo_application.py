@@ -666,4 +666,134 @@ def test_backpressure_delay_does_not_reject():
     assert "saga_execute" in result.decision_path
 
 
+# ---------------------------------------------------------------------------
+# 17. P-V15-1: Cleanup-Atomicity Tests (Cross-LLM-V15 Konsens-Patch)
+# ---------------------------------------------------------------------------
+
+
+def test_release_lock_returns_status_dict():
+    """P-V15-1: _release_lock liefert dict {'released': bool, 'reason': str}."""
+    pipe = _build_pipeline()
+    _enable_strategy(pipe, PRIMARY)
+    # Trade ausfuehren -> Stage 9 ruft _release_lock
+    result = _submit(pipe, instrument_id="ATOMUSDT")
+    assert result.success is True
+
+    # Manueller Aufruf nach erfolgreichem Run: keine aktive Lease.
+    rel = pipe._release_lock("ATOMUSDT", PositionSide.LONG)
+    assert isinstance(rel, dict)
+    assert "released" in rel
+    assert "reason" in rel
+    assert rel["released"] is True
+    assert rel["reason"] == "no_lease"
+
+
+def test_release_lock_failure_marks_cleanup_failed():
+    """P-V15-1: lock_manager.release-Failure -> success=False + cleanup_failed in reason."""
+    pipe = _build_pipeline()
+    _enable_strategy(pipe, PRIMARY)
+
+    # Patch lock_manager.release zu einem Failure-Result
+    from kmo_governance.kpm_distributed_lock_manager import TradeLockResult
+
+    real_release = pipe.lock_manager.release
+
+    def failing_release(instrument_id, position_side, lease_token):
+        return TradeLockResult(
+            success=False,
+            instrument_id=instrument_id,
+            position_side=position_side,
+            timestamp=time.time(),
+            reason="simulated_release_failure",
+        )
+
+    pipe.lock_manager.release = failing_release
+
+    result = _submit(pipe, instrument_id="OPUSDT")
+    # Despite Saga-Success, Cleanup-Failure -> success=False
+    assert result.success is False
+    assert "cleanup_failed" in result.reason
+    assert "simulated_release_failure" in result.reason
+
+    # Restore
+    pipe.lock_manager.release = real_release
+
+
+def test_pipeline_returns_failure_on_cleanup_fail():
+    """P-V15-1: Saga-Failure + Release-Failure -> success=False mit beiden Reasons."""
+    pipe = _build_pipeline()
+    _enable_strategy(pipe, PRIMARY)
+
+    # Saga-Failure simulieren
+    def execute_fails(_step: SagaStep) -> dict:
+        raise RuntimeError("simulated saga failure")
+
+    pipe.saga.register_handler(SagaPhase.EXECUTE, execute_fails)
+
+    # Release-Failure simulieren
+    from kmo_governance.kpm_distributed_lock_manager import TradeLockResult
+
+    def failing_release(instrument_id, position_side, lease_token):
+        return TradeLockResult(
+            success=False,
+            instrument_id=instrument_id,
+            position_side=position_side,
+            timestamp=time.time(),
+            reason="release_failed_too",
+        )
+
+    pipe.lock_manager.release = failing_release
+
+    result = _submit(pipe, instrument_id="MATICUSDT")
+    assert result.success is False
+    assert "saga_failed" in result.reason
+    assert "cleanup_failed" in result.reason
+    assert "release_failed_too" in result.reason
+
+
+def test_double_release_idempotent():
+    """P-V15-1: 2x _release_lock im selben Run -> 2. Aufruf no-op (kein Double-Release)."""
+    pipe = _build_pipeline()
+    _enable_strategy(pipe, PRIMARY)
+
+    # 1. submit_trade fuer state-setup
+    result = _submit(pipe, instrument_id="LINKUSDT")
+    assert result.success is True
+    # Nach erfolgreichem Run sollte _lease_token None sein
+    assert pipe._lease_token is None
+
+    # 2. Manuelle 2x _release_lock-Calls -> beide no-op (kein Crash)
+    rel1 = pipe._release_lock("LINKUSDT", PositionSide.LONG)
+    assert rel1["released"] is True
+    assert rel1["reason"] == "no_lease"
+
+    rel2 = pipe._release_lock("LINKUSDT", PositionSide.LONG)
+    assert rel2["released"] is True
+    assert rel2["reason"] == "no_lease"
+
+    # 3. Counter-Track: Anzahl real_release-Calls in lock_manager
+    call_count = {"n": 0}
+    real_release = pipe.lock_manager.release
+
+    def counting_release(instrument_id, position_side, lease_token):
+        call_count["n"] += 1
+        return real_release(
+            instrument_id=instrument_id,
+            position_side=position_side,
+            lease_token=lease_token,
+        )
+
+    pipe.lock_manager.release = counting_release
+
+    # Frischer Run mit aktivem Token, dann Doppel-Release-Versuch
+    result2 = _submit(pipe, instrument_id="LINKUSDT", client_order_id="ord-2")
+    # Stage-9 hat genau 1x release ausgefuehrt
+    assert call_count["n"] == 1
+    # _lease_token ist nach erfolgreichem Stage-9 None
+    assert pipe._lease_token is None
+    # Manueller Doppel-Release nach success-Run -> no-op (no real release)
+    pipe._release_lock("LINKUSDT", PositionSide.LONG)
+    assert call_count["n"] == 1  # Counter unveraendert -> idempotent
+
+
 # CRUX-MK

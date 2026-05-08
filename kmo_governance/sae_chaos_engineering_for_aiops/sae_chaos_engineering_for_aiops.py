@@ -344,8 +344,25 @@ class SAEChaosEngineering:
                 self._active_chaos_count -= 1
 
         with self._lock:
+            # P-V15-2: _outcomes ist deque(maxlen=N). Bei Ueberlauf
+            # evicted die deque automatisch das aelteste Element (links).
+            # _scenarios_by_outcome ist dict ohne maxlen — ohne Eviction
+            # wuerde das dict unbounded waehrend _outcomes bei N stagniert.
+            # Fix: vor append leftmost-id capturen wenn deque voll, NACH
+            # append aus dict poppen (wenn noch nicht durch Re-Add ueberschrieben).
+            evicted_id: Optional[str] = None
+            if len(self._outcomes) == self._outcomes.maxlen:
+                evicted_id = self._outcomes[0].scenario_id
             self._outcomes.append(outcome)
             self._scenarios_by_outcome[outcome.scenario_id] = scenario
+            if evicted_id is not None:
+                # Nur poppen wenn noch keine andere Outcome dieselbe scenario_id
+                # in der deque hat (Schutz gegen wiederholte scenario_ids).
+                still_referenced = any(
+                    out.scenario_id == evicted_id for out in self._outcomes
+                )
+                if not still_referenced:
+                    self._scenarios_by_outcome.pop(evicted_id, None)
         return outcome
 
     def inject_random(
