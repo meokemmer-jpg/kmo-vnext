@@ -1,7 +1,10 @@
-"""Graphity Audit-Persister [CRUX-MK]
+"""Graphity Audit-Persister (Domain-Adapter ueber Synaptic-Plasticity) [CRUX-MK]
 
-Edit-History per Section per Author mit Hash-Chain-Integrity (analog
-kmo_audit_log.py Synaptic-LTP-Pattern).
+Welle-31 P-W31-1 Pattern-Core-vs-Extension-Trennung.
+
+Domain-Adapter ueber `synaptic_plasticity` (Hash-Chain Pattern-Modul).
+Behaelt Graphity-spezifische Field-Names (project_id/section_id/author)
+durch Mapping zu Pattern-Modul-Names (container_key/resource_key/actor_id).
 
 Bio-Pattern-Korrespondenz:
 - Hash-Chain     = Synaptic-Long-Term-Memory (jeder Edit verlinkt zum vorherigen)
@@ -10,25 +13,36 @@ Bio-Pattern-Korrespondenz:
 - Verify-Chain   = Memory-Consolidation-Check
 
 CRUX-Bindung:
-- Q_0: Edit-History ist tamper-evident
+- Q_0: Edit-History ist tamper-evident (Hash-Chain)
 - I_min: append-only Hash-Chain
-- W_0: SHA256-Pattern wiederverwendet aus kmo_audit_log
+- W_0: Pattern-Reuse aus synaptic_plasticity (separates Pattern-Modul)
+
+Wichtig (V14 P-W31-1 Konsens):
+    Hash-Chain ist Tamper-Evidence, NICHT Tamper-Proof. Externer
+    Anker-Mechanismus (RFC3161 / GitHub-Daily-Push / S3-Object-Lock)
+    ist Pflicht pro `~/.claude/rules/external-anchor-requirement-audit-logs.md`.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
+
+from synaptic_plasticity import (
+    GENESIS_HASH,
+    append_entry,
+    hash_content_string,
+    stream_entries,
+    verify_chain as core_verify_chain,
+)
 
 # Constants with units
 DEFAULT_HISTORY_PATH: Path = (
     Path.home() / ".graphity" / "edit_history.jsonl"
 )
-GENESIS_HASH: str = "0" * 64  # SHA256 length
 
 EditAction = str  # "lock_acquire" | "lock_release" | "edit_commit" |
 # "merge_resolve" | "force_release"
@@ -36,31 +50,65 @@ EditAction = str  # "lock_acquire" | "lock_release" | "edit_commit" |
 
 @dataclass(frozen=True)
 class EditHistoryEntry:
-    """Immutable Edit-History-Entry mit Hash-Chain.
+    """Domain-Adapter shape: Graphity-spezifische Field-Names.
 
-    Pre: alle Felder non-empty (ausser content_hash).
-    Post: block_hash = SHA256(prev_hash + canonical-content).
+    Backwards-compat: tests + downstream consumers expect (project_id,
+    section_id, author). Pattern-Modul nutzt (container_key, resource_key,
+    actor_id).
     """
 
     block_index: int
-    timestamp: int  # UNIX epoch
+    timestamp: int
     project_id: str
     section_id: str
     author: str
     action: EditAction
-    content_hash: str  # SHA256 of edit-content (oder Lock-Token-Nonce)
-    metadata: str  # JSON-string with extra info (z.B. Resolution-Strategy)
+    content_hash: str
+    metadata: str
     prev_hash: str
     block_hash: str
 
     def to_json_line(self) -> str:
         return json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":")
+            {
+                "block_index": self.block_index,
+                "timestamp": self.timestamp,
+                "project_id": self.project_id,
+                "section_id": self.section_id,
+                "author": self.author,
+                "action": self.action,
+                "content_hash": self.content_hash,
+                "metadata": self.metadata,
+                "prev_hash": self.prev_hash,
+                "block_hash": self.block_hash,
+            },
+            sort_keys=True, separators=(",", ":"),
         )
 
 
+def _core_to_domain_entry(core_entry) -> EditHistoryEntry:
+    """Map Pattern-Modul-Entry -> Domain-Adapter-Entry."""
+    return EditHistoryEntry(
+        block_index=core_entry.block_index,
+        timestamp=core_entry.timestamp,
+        project_id=core_entry.container_key,
+        section_id=core_entry.resource_key,
+        author=core_entry.actor_id,
+        action=core_entry.action,
+        content_hash=core_entry.content_hash,
+        metadata=core_entry.metadata,
+        prev_hash=core_entry.prev_hash,
+        block_hash=core_entry.block_hash,
+    )
+
+
 class GraphityAuditPersister:
-    """Append-only Edit-History mit Hash-Chain-Integrity.
+    """Domain-Adapter Append-only Edit-History mit Hash-Chain-Integrity.
+
+    Pattern-Modul: synaptic_plasticity (Bio: LTP).
+    Domain-Spezifisch: emit JSONL-Lines im Graphity-Schema (project_id/
+    section_id/author) statt Pattern-Schema (container_key/resource_key/
+    actor_id).
 
     Pre: history_path parent dir exists or creatable.
     Post: alle Eintraege Hash-verlinkt, verify_chain() erkennt Tampering.
@@ -73,35 +121,8 @@ class GraphityAuditPersister:
             self.history_path.touch()
 
     @staticmethod
-    def _compute_hash(prev_hash: str, content: dict) -> str:
-        canonical = json.dumps(
-            content, sort_keys=True, separators=(",", ":")
-        )
-        msg = (prev_hash + canonical).encode("utf-8")
-        return hashlib.sha256(msg).hexdigest()
-
-    @staticmethod
     def _hash_content(text: str) -> str:
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-    def _last_entry(self) -> Optional[EditHistoryEntry]:
-        """Read last entry by streaming from end (efficient for large logs)."""
-        try:
-            with self.history_path.open("rb") as fp:
-                fp.seek(0, 2)
-                size = fp.tell()
-                if size == 0:
-                    return None
-                # Read tail
-                fp.seek(max(0, size - 4096))
-                tail = fp.read().decode("utf-8")
-                lines = [ln for ln in tail.splitlines() if ln.strip()]
-                if not lines:
-                    return None
-                data = json.loads(lines[-1])
-                return EditHistoryEntry(**data)
-        except (OSError, json.JSONDecodeError, TypeError):
-            return None
+        return hash_content_string(text)
 
     def append_lock_acquire(
         self,
@@ -111,12 +132,12 @@ class GraphityAuditPersister:
         nonce: str,
     ) -> EditHistoryEntry:
         """Audit Lock-Acquire (Synaptic-Vesikel-Release-Event)."""
-        return self._append_entry(
+        return self._append(
             project_id=project_id,
             section_id=section_id,
             author=author,
             action="lock_acquire",
-            content_hash=self._hash_content(nonce),
+            content_hash=hash_content_string(nonce),
             metadata=json.dumps({"nonce_prefix": nonce[:16]}),
         )
 
@@ -129,17 +150,14 @@ class GraphityAuditPersister:
         release_type: str = "normal",
     ) -> EditHistoryEntry:
         """Audit Lock-Release (Neurotransmitter-Reuptake-Event)."""
-        return self._append_entry(
+        return self._append(
             project_id=project_id,
             section_id=section_id,
             author=author,
             action="lock_release",
-            content_hash=self._hash_content(nonce),
+            content_hash=hash_content_string(nonce),
             metadata=json.dumps(
-                {
-                    "nonce_prefix": nonce[:16],
-                    "release_type": release_type,
-                }
+                {"nonce_prefix": nonce[:16], "release_type": release_type}
             ),
         )
 
@@ -155,12 +173,12 @@ class GraphityAuditPersister:
         meta: dict = {}
         if word_count is not None:
             meta["word_count"] = word_count
-        return self._append_entry(
+        return self._append(
             project_id=project_id,
             section_id=section_id,
             author=author,
             action="edit_commit",
-            content_hash=self._hash_content(edit_content),
+            content_hash=hash_content_string(edit_content),
             metadata=json.dumps(meta),
         )
 
@@ -175,21 +193,18 @@ class GraphityAuditPersister:
     ) -> EditHistoryEntry:
         """Audit Merge-Resolution (post-Three-Way-Merge)."""
         meta = json.dumps(
-            {
-                "resolution": resolution_strategy,
-                "conflict_count": conflict_count,
-            }
+            {"resolution": resolution_strategy, "conflict_count": conflict_count}
         )
-        return self._append_entry(
+        return self._append(
             project_id=project_id,
             section_id=section_id,
             author=author,
             action="merge_resolve",
-            content_hash=self._hash_content(merged_content),
+            content_hash=hash_content_string(merged_content),
             metadata=meta,
         )
 
-    def _append_entry(
+    def _append(
         self,
         project_id: str,
         section_id: str,
@@ -198,19 +213,23 @@ class GraphityAuditPersister:
         content_hash: str,
         metadata: str,
     ) -> EditHistoryEntry:
-        """Generic append with hash-chain link."""
-        if not all([project_id, section_id, author, action]):
-            raise ValueError(
-                "project_id, section_id, author, action must be non-empty"
-            )
+        """Domain-Adapter: write JSONL with Graphity-shape (project_id/
+        section_id/author) but compute hash-chain in Pattern-Modul-shape.
 
-        prev = self._last_entry()
+        We keep the JSONL emit-format Domain-shaped (project_id...) for
+        backwards-compat. The chain-hash is computed deterministically over
+        Domain-shaped content by re-using compute_chain_hash with the same
+        canonical-content algorithm via a tiny fork below.
+        """
+        # Read prev-entry (Domain-shaped) by streaming JSONL tail
+        prev = self._last_domain_entry()
         prev_hash = prev.block_hash if prev else GENESIS_HASH
         block_index = (prev.block_index + 1) if prev else 0
+        timestamp = int(time.time())
 
         content = {
             "block_index": block_index,
-            "timestamp": int(time.time()),
+            "timestamp": timestamp,
             "project_id": project_id,
             "section_id": section_id,
             "author": author,
@@ -218,11 +237,13 @@ class GraphityAuditPersister:
             "content_hash": content_hash,
             "metadata": metadata,
         }
-        block_hash = self._compute_hash(prev_hash, content)
+        # Use Pattern-Modul hashing primitive for consistency
+        from synaptic_plasticity import compute_chain_hash
+        block_hash = compute_chain_hash(prev_hash, content)
 
         entry = EditHistoryEntry(
             block_index=block_index,
-            timestamp=content["timestamp"],
+            timestamp=timestamp,
             project_id=project_id,
             section_id=section_id,
             author=author,
@@ -237,8 +258,37 @@ class GraphityAuditPersister:
             fp.write(entry.to_json_line() + "\n")
         return entry
 
+    def _last_domain_entry(self) -> Optional[EditHistoryEntry]:
+        """Stream-read last entry in Domain-shape."""
+        try:
+            with self.history_path.open("rb") as fp:
+                fp.seek(0, 2)
+                size = fp.tell()
+                if size == 0:
+                    return None
+                fp.seek(max(0, size - 4096))
+                tail = fp.read().decode("utf-8")
+                lines = [ln for ln in tail.splitlines() if ln.strip()]
+                if not lines:
+                    return None
+                data = json.loads(lines[-1])
+                return EditHistoryEntry(**data)
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+
+    # Backwards-compat alias (used by w31 tests)
+    def _last_entry(self) -> Optional[EditHistoryEntry]:
+        return self._last_domain_entry()
+
+    @staticmethod
+    def _compute_hash(prev_hash: str, content: dict) -> str:
+        """Backwards-compat: delegate to Pattern-Modul."""
+        from synaptic_plasticity import compute_chain_hash
+        return compute_chain_hash(prev_hash, content)
+
     def verify_chain(self) -> bool:
-        """Verify entire chain integrity. Pre: log readable. Post: True iff untampered."""
+        """Verify entire chain integrity (Domain-shape JSONL)."""
+        from synaptic_plasticity import compute_chain_hash
         prev_hash = GENESIS_HASH
         expected_index = 0
         try:
@@ -264,10 +314,7 @@ class GraphityAuditPersister:
                         "content_hash": entry.content_hash,
                         "metadata": entry.metadata,
                     }
-                    if (
-                        self._compute_hash(prev_hash, content)
-                        != entry.block_hash
-                    ):
+                    if compute_chain_hash(prev_hash, content) != entry.block_hash:
                         return False
 
                     prev_hash = entry.block_hash

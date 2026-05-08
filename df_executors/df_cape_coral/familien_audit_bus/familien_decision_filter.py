@@ -1,7 +1,14 @@
-"""Familien-Decision-Filter (Lymphatic-Knoten pro Familien-Mitglied) [CRUX-MK]
+"""Familien-Decision-Filter (Domain-Extension-Adapter) [CRUX-MK]
 
-Pro Familien-Mitglied ein Filter-Layer mit consent_domains (Veto-Recht), info_domains
-(nur informieren) + optional custom_filter_func. Bio: Lymphatic-Knoten + Antikoerper.
+Welle-31 P-W31-1 Pattern-Core-vs-Extension-Trennung.
+
+This module is a **Domain-Extension-Adapter** over `lymphatic_core`:
+it adapts the generic `FilterResult` to a Cape-Coral-Familien view via
+the legacy `FilterDecision` mutable type, the 5-Domain-Whitelist, the
+proposer/consent/info-only relevance axes, and the `custom_filter_func`
+hook.
+
+The Pattern-Core (lymphatic_core.py) does NOT depend on any of this.
 """
 from __future__ import annotations
 
@@ -9,26 +16,26 @@ import time
 from dataclasses import dataclass
 from typing import Callable, TYPE_CHECKING
 
+from lymphatic_core import (
+    ACTION_APPROVE,
+    ACTION_VETO,
+    ACTION_INFO_ACKNOWLEDGED,
+    ACTION_ABSTAIN,
+    VALID_ACTIONS,
+    FilterResult,
+)
+
 if TYPE_CHECKING:
     from familien_audit_bus import FamilienDecisionEnvelope
 
 
-# Filter-Action-Konstanten (Trinity-Pattern)
-ACTION_APPROVE = "approve"
-ACTION_VETO = "veto"
-ACTION_INFO_ACKNOWLEDGED = "info_acknowledged"
-ACTION_ABSTAIN = "abstain"
-
-VALID_ACTIONS = frozenset({
-    ACTION_APPROVE, ACTION_VETO, ACTION_INFO_ACKNOWLEDGED, ACTION_ABSTAIN,
-})
-
-
 @dataclass
 class FilterDecision:
-    """Resultat eines Filter-Nodes pro Decision.
+    """Mutable Domain-Adapter for a filter-node decision.
 
-    Pre: action in VALID_ACTIONS. Post: rationale non-empty wenn action == veto.
+    Backwards-compatible mutable shape (custom_filter_func expects to be able
+    to construct + adjust). The Pattern-Core uses the immutable FilterResult.
+    `to_filter_result()` bridges the two.
     """
 
     member_id: str
@@ -37,17 +44,26 @@ class FilterDecision:
     rationale: str = ""
     timestamp: float = 0.0
 
+    def to_filter_result(self) -> FilterResult:
+        return FilterResult(
+            node_id=self.member_id,
+            envelope_id=self.decision_id,
+            action=self.action,
+            rationale=self.rationale,
+            timestamp=self.timestamp,
+        )
+
 
 class FamilienDecisionFilter:
-    """Filter-Node fuer ein Familien-Mitglied (Lymphatic-Knoten).
+    """Lymphatic-Knoten Domain-Adapter for one Familien-Mitglied.
 
-    Default-Verhalten:
-    - Mitglied = proposer -> info_acknowledged (eigene Initiative)
-    - Mitglied in requires_consent + Domain in consent_domains -> approve
-    - Mitglied in info_only oder Domain in info_domains -> info_acknowledged
-    - Sonst: abstain
+    Domain-Extensions:
+    - 5-Domain-Whitelist via `consent_domains` / `info_domains`
+    - Proposer-self-relevance (member == proposer -> info_acknowledged)
+    - `custom_filter_func` hook for member-specific Logik (z.B. K_0-Schwellen)
 
-    custom_filter_func erlaubt mitglied-spezifische Logik (z.B. K_0-Schwellen).
+    The Pattern-Core stays agnostic to all of these; it only knows
+    "node_id -> FilterFn".
     """
 
     def __init__(
@@ -65,12 +81,12 @@ class FamilienDecisionFilter:
         self.custom_filter_func = custom_filter_func
 
     def evaluate(self, envelope) -> FilterDecision:
-        """Evaluiert Decision gegen Mitglied-Kriterien.
+        """Evaluiert Decision gegen Mitglied-Kriterien (domain-spezifisch).
 
         Pre: envelope valid (decision_id, domain, payload).
         Post: FilterDecision mit deterministischer action.
         """
-        # 1. Custom-Filter hat Vorrang
+        # 1. Custom-Filter (Domain-Extension) hat Vorrang
         if self.custom_filter_func is not None:
             result = self.custom_filter_func(envelope)
             if result.action not in VALID_ACTIONS:
@@ -87,7 +103,7 @@ class FamilienDecisionFilter:
                 result.timestamp = time.time()
             return result
 
-        # 2. Eigener Vorschlag -> Acknowledged
+        # 2. Eigener Vorschlag -> Acknowledged (Domain-Extension)
         if self.member_id == envelope.proposer_member_id:
             return FilterDecision(
                 member_id=self.member_id,
@@ -97,7 +113,7 @@ class FamilienDecisionFilter:
                 timestamp=time.time(),
             )
 
-        # 3. Consent-Berechtigt + Domain passt -> default approve
+        # 3. Consent-Berechtigt + Domain-Whitelist (Domain-Extension)
         if (
             self.member_id in envelope.requires_consent
             and envelope.domain in self.consent_domains
@@ -110,7 +126,7 @@ class FamilienDecisionFilter:
                 timestamp=time.time(),
             )
 
-        # 4. Info-Only-Pfad
+        # 4. Info-Only-Pfad (Domain-Extension)
         if (
             self.member_id in envelope.info_only
             or envelope.domain in self.info_domains

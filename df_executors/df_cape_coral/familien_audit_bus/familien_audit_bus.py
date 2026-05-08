@@ -1,8 +1,16 @@
-"""Familien-Audit-Bus (Lymphatic-Pattern Core) [CRUX-MK]
+"""Familien-Audit-Bus (Domain-Adapter ueber Lymphatic-Core) [CRUX-MK]
 
-Bio-Pattern: Lymphatic-Knoten -> Familien-Mitglied. Antigen -> Familien-Decision.
-Filter-Kriterium -> Mitglied-spezifisch. Verteilte Filterung + Audit-Trail-Sammlung.
-Pattern-Reuse aus kmo_governance/outbox-pattern: atomic_write_json, EventEnvelope-Style.
+Welle-31 P-W31-1 Pattern-Core-vs-Extension-Trennung.
+
+The Bus is a **Domain-Adapter** combining:
+- `lymphatic_core.evaluate_envelope` + `aggregate_veto`  (Pattern-Core)
+- 5-Domain-Whitelist (Cape-Coral)                        (Extension)
+- SQLite-backed seq-counter + finalized-set              (Extension)
+- Audit-Persister attach (Cape-Coral-Vault PARA)         (Extension)
+- Proposer/Consent/Info-Only relevance axes              (Extension)
+
+Pattern-Reuse aus kmo_governance/outbox-pattern: atomic_write_json,
+EventEnvelope-Style.
 
 Spec: Welle-30 W-30-1 (Hotel/Trading -> Cape-Coral-Vault Familien-Verwaltung).
 """
@@ -18,12 +26,18 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from lymphatic_core import (
+    FINAL_VETOED,
+    aggregate_veto,
+    evaluate_envelope,
+)
+
 if TYPE_CHECKING:
     from familien_decision_filter import FamilienDecisionFilter, FilterDecision
     from familien_audit_persister import FamilienAuditPersister
 
 
-# Familien-Decision-Domains (CLAUDE.md Cape-Coral-Relocation Q_0/K_0-Naehe)
+# Familien-Decision-Domains (Domain-Extension: 5-Domain-Whitelist)
 DOMAIN_RELOCATION = "relocation"  # Cape-Coral-Move, Wegzugssteuer, E-2 Visa
 DOMAIN_HEALTH = "health"          # Gesundheits-Decision
 DOMAIN_EDUCATION = "education"    # Schule, Ausbildung
@@ -38,11 +52,7 @@ VALID_DOMAINS = frozenset({
 
 @dataclass
 class FamilienDecisionEnvelope:
-    """Envelope fuer Familien-Decision (Antigen-Aequivalent).
-
-    Pre: decision_id UUID4-str, domain in VALID_DOMAINS, proposer_member_id non-empty.
-    Post: filename() deterministisch fuer (domain, seq).
-    """
+    """Domain-Envelope (Cape-Coral-spezifisch)."""
 
     decision_id: str
     proposer_member_id: str
@@ -85,13 +95,12 @@ def atomic_write_json(target: Path, data: dict) -> None:
 
 
 class FamilienAuditBus:
-    """Lymphatic-Bus fuer Familien-Decisions.
+    """Lymphatic-Bus Domain-Adapter (Cape-Coral).
 
-    Verteilt eingehende Decisions an alle registrierten Filter-Nodes (Familien-
-    Mitglieder), sammelt deren Filter-Resultate, persistiert Audit-Trail.
-
-    Pre: bus_dir + audit_dir schreibbar.
-    Post: Decisions durchlaufen alle Filter, Audit-Trail atomar.
+    Pattern-Core ist `lymphatic_core` (evaluate_envelope + aggregate_veto).
+    Diese Klasse fuegt Cape-Coral-spezifische Logik hinzu: 5-Domain-Whitelist,
+    Multi-Axis-Relevance (proposer/consent/info-only), SQLite-State,
+    Persister-Attach.
     """
 
     def __init__(
@@ -178,11 +187,7 @@ class FamilienAuditBus:
         info_only: list | None = None,
         decision_id: str | None = None,
     ) -> FamilienDecisionEnvelope:
-        """Reicht Familien-Decision in Bus ein (atomar persistiert).
-
-        Pre: domain in VALID_DOMAINS, title + proposer_member_id non-empty.
-        Post: Envelope existiert in bus_dir, naechster process_pending()-Run finalisiert.
-        """
+        """Reicht Familien-Decision in Bus ein (atomar persistiert)."""
         if domain not in VALID_DOMAINS:
             raise ValueError(f"domain {domain!r} not in {VALID_DOMAINS}")
         if not title:
@@ -225,11 +230,30 @@ class FamilienAuditBus:
             )
             conn.commit()
 
-    def process_pending(self) -> dict:
-        """Laeuft Pending-Decisions durch alle Filter-Nodes + persistiert Audit-Trail.
+    # --- Domain-Extension: relevance + veto-eligibility callbacks ---
 
-        Returns: stats dict (polled, processed, skipped_finalized, vetoed_count, ...).
-        Idempotent: bereits finalisierte Decisions geskippt.
+    @staticmethod
+    def _relevance(node_id: str, envelope) -> bool:
+        """Cape-Coral Multi-Axis-Relevance (Domain-Extension)."""
+        return (
+            node_id == envelope.proposer_member_id
+            or node_id in envelope.requires_consent
+            or node_id in envelope.info_only
+        )
+
+    @staticmethod
+    def _make_veto_eligibility(envelope):
+        """Cape-Coral Veto-Eligibility: only consent-required nodes can veto."""
+        consent_set = set(envelope.requires_consent)
+        return lambda node_id: node_id in consent_set
+
+    # --- Bus-Loop: Pattern-Core dispatch + Cape-Coral state mgmt ---
+
+    def process_pending(self) -> dict:
+        """Laeuft Pending-Decisions durch Pattern-Core + persistiert.
+
+        Pattern-Core: lymphatic_core.evaluate_envelope + aggregate_veto.
+        Domain-Adapter: SQLite-Idempotency, Multi-Axis-Relevance, Persister.
         """
         stats = {
             "polled": 0, "processed": 0, "skipped_finalized": 0,
@@ -237,6 +261,12 @@ class FamilienAuditBus:
         }
         if not self.bus_dir.exists():
             return stats
+
+        # Build node_id -> filter-fn map (domain-side)
+        filter_fns = {
+            mid: lambda env, f=f: f.evaluate(env).to_filter_result()
+            for mid, f in self._filters.items()
+        }
 
         for bus_file in sorted(self.bus_dir.glob("*.json")):
             if bus_file.name.startswith(".tmp-"):
@@ -254,44 +284,48 @@ class FamilienAuditBus:
                 stats["skipped_finalized"] += 1
                 continue
 
-            # Lymphatic-Verteilung: Decision an alle relevanten Filter-Nodes
-            filter_results = []
-            for member_id, member_filter in self._filters.items():
-                relevant = (
-                    member_id == envelope.proposer_member_id
-                    or member_id in envelope.requires_consent
-                    or member_id in envelope.info_only
-                )
-                if not relevant:
-                    continue
-                try:
-                    filter_results.append(member_filter.evaluate(envelope))
-                except Exception as e:
-                    stats["errors"].append(
-                        f"filter-error {member_id}/{envelope.decision_id}: {e}"
-                    )
+            # Pattern-Core: fan-out + aggregate
+            results, errors = evaluate_envelope(
+                envelope=envelope,
+                envelope_id=envelope.decision_id,
+                filter_nodes=filter_fns,
+                relevance_fn=self._relevance,
+                veto_eligibility_fn=lambda nid, env: nid in set(env.requires_consent),
+            )
+            stats["errors"].extend(errors)
+            final_state, veto_count = aggregate_veto(
+                results, self._make_veto_eligibility(envelope)
+            )
 
-            # Aggregation: Veto durch Consent-Berechtigte = Block
-            veto_results = [
-                r for r in filter_results
-                if r.member_id in envelope.requires_consent and r.action == "veto"
-            ]
-            final_state = "vetoed" if veto_results else "approved"
-            if veto_results:
+            if final_state == FINAL_VETOED:
                 stats["vetoed_count"] += 1
             else:
                 stats["approved_count"] += 1
 
+            # Persister expects legacy FilterDecision shape; rebuild from
+            # FilterResult-Frozen-Type for backwards-compat.
+            from familien_decision_filter import FilterDecision
+            legacy_results = [
+                FilterDecision(
+                    member_id=r.node_id,
+                    decision_id=r.envelope_id,
+                    action=r.action,
+                    rationale=r.rationale,
+                    timestamp=r.timestamp,
+                )
+                for r in results
+            ]
+
             if self._persister is not None:
                 try:
-                    self._persister.persist(envelope, filter_results, final_state)
+                    self._persister.persist(envelope, legacy_results, final_state)
                 except Exception as e:
                     stats["errors"].append(f"persist-error {envelope.decision_id}: {e}")
 
             self._record_finalized(
                 envelope, final_state,
-                filter_count=len(filter_results),
-                veto_count=len(veto_results),
+                filter_count=len(results),
+                veto_count=veto_count,
             )
             stats["processed"] += 1
 

@@ -1,28 +1,38 @@
-"""SAE-v8 Robustness-Metrics [CRUX-MK].
+"""SAE-v8 Robustness-Metrics (Domain-Adapter ueber Apoptose-Core) [CRUX-MK].
 
-Welle-30 W-30-2. Bio-Aequivalent: Cytochrome-c-Snapshot-Forensik.
+Welle-31 P-W31-1 Pattern-Core-vs-Extension-Trennung.
+
+Domain-Adapter:
+- `apoptose_core.cascade_containment_score` + `slot_is_actually_unhealthy`  (Pattern-Core)
+- `trinity_decay_profile`-spezifische RTH + Deadlines                        (Extension)
+
 Mathematik: RTH = inf{t > t_inject : health(t) >= threshold}, else +inf;
 CCS = 1 - (affected / total_at_risk_within_hotel); BVK = correct/total.
-Variant-Deadlines: Conservative <60s, Aggressive <180s, Contrarian binaer.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .sae_failure_injector import (
-    FailureMode, MockSlot, SaeFailureInjector, SlotVariant,
+from .apoptose_core import (
+    DEFAULT_UNHEALTHY_THRESHOLD,
+    cascade_containment_score as core_ccs,
+    cascade_radius_in_tenant,
+    slot_is_actually_unhealthy,
+)
+from .sae_failure_injector import MockSlot, SaeFailureInjector
+from .trinity_decay_profile import (
+    DEFAULT_RECOVERY_DEADLINE_AGGRESSIVE_SEC,
+    DEFAULT_RECOVERY_DEADLINE_CONSERVATIVE_SEC,
+    DEFAULT_RECOVERY_DEADLINE_CONTRARIAN_SEC,
+    SlotVariant,
+    profile_for_variant,
 )
 
 
 DEFAULT_HEALTH_RECOVERY_THRESHOLD: float = 0.5
-DEFAULT_UNHEALTHY_THRESHOLD: float = 0.3
 DEFAULT_CASCADE_RADIUS_LIMIT: int = 3
-DEFAULT_RECOVERY_DEADLINE_CONSERVATIVE_SEC: float = 60.0
-DEFAULT_RECOVERY_DEADLINE_AGGRESSIVE_SEC: float = 180.0
-DEFAULT_RECOVERY_DEADLINE_CONTRARIAN_SEC: float = float("inf")
 
 
 @dataclass(frozen=True)
@@ -75,7 +85,12 @@ class RobustnessReport:
 
 
 class SaeRobustnessMetrics:
-    """Berechnet Robustness-Metriken (read-only)."""
+    """Berechnet Robustness-Metriken (read-only).
+
+    Domain-Adapter: delegiert cascade-radius/cascade-containment/
+    is-actually-unhealthy an apoptose_core, RTH+Deadlines an
+    trinity_decay_profile.
+    """
 
     def __init__(self, injector: SaeFailureInjector) -> None:
         self.injector = injector
@@ -85,63 +100,45 @@ class SaeRobustnessMetrics:
         threshold: float = DEFAULT_HEALTH_RECOVERY_THRESHOLD,
         max_check_sec: float = 600.0, step_sec: float = 1.0,
     ) -> float:
-        """RTH analytisch (Conservative: exponential), variant-spezifisch."""
+        """RTH variant-spezifisch via DecayProfile (Domain-Extension)."""
         slot = self.injector.get_slot(slot_id, hotel_id)
         if slot is None or not slot.injection_history:
             return 0.0
-        if slot.is_crashed:
-            return float("inf")
         h0 = max(slot.health_score, 0.0)
-
-        if slot.variant is SlotVariant.CONSERVATIVE:
-            from .sae_failure_injector import DEFAULT_RECOVERY_TIME_CONSTANT_SEC
-            tau = DEFAULT_RECOVERY_TIME_CONSTANT_SEC
-            if h0 >= threshold:
-                return 0.0
-            if 1.0 - h0 <= 0:
-                return float("inf")
-            ratio = (threshold - h0) / (1.0 - h0)
-            if ratio >= 1.0:
-                return float("inf")
-            return -tau * math.log(1.0 - ratio)
-        elif slot.variant is SlotVariant.AGGRESSIVE:
-            if h0 >= threshold:
-                return 0.0
-            return float("inf")  # ohne Reset keine Recovery
-        else:  # CONTRARIAN
-            return 0.0 if h0 >= threshold else float("inf")
+        profile = profile_for_variant(slot.variant)
+        return profile.recovery_time_to_threshold(h0, threshold, slot.is_crashed)
 
     def cascade_radius(
         self, target_slot: MockSlot, peer_slots: list[MockSlot],
         unhealthy_threshold: float = DEFAULT_UNHEALTHY_THRESHOLD,
     ) -> int:
-        """Anzahl Peer-Slots im selben hotel mit health < threshold (target excluded)."""
-        count = 0
-        for peer in peer_slots:
-            if peer.slot_id == target_slot.slot_id and peer.hotel_id == target_slot.hotel_id:
-                continue
-            if peer.hotel_id != target_slot.hotel_id:
-                continue
-            current_health = self.injector.compute_health(peer.slot_id, peer.hotel_id)
-            if current_health < unhealthy_threshold:
-                count += 1
-        return count
+        """Anzahl Peer-Slots im selben hotel mit health < threshold (target excluded).
+
+        Delegate to apoptose_core.cascade_radius_in_tenant. SAE-Domain
+        nutzt 'hotel_id' als Tenant-Feld (Pattern-Core: 'tenant_attr').
+        """
+        return cascade_radius_in_tenant(
+            target_slot_id=target_slot.slot_id,
+            target_tenant_id=target_slot.hotel_id,
+            peers=peer_slots,
+            tenant_attr="hotel_id",
+            health_lookup=self.injector.compute_health,
+            unhealthy_threshold=unhealthy_threshold,
+        )
 
     def cascade_containment_score(
         self, target_slot: MockSlot, peer_slots: list[MockSlot],
         unhealthy_threshold: float = DEFAULT_UNHEALTHY_THRESHOLD,
     ) -> float:
-        """CCS in [0,1]: 1.0 = perfekt isoliert; 0.0 = alles betroffen."""
-        peers_at_risk = [
-            p for p in peer_slots
-            if p.hotel_id == target_slot.hotel_id
-            and not (p.slot_id == target_slot.slot_id and p.hotel_id == target_slot.hotel_id)
-        ]
-        total = len(peers_at_risk)
-        if total == 0:
-            return 1.0
-        affected = self.cascade_radius(target_slot, peer_slots, unhealthy_threshold)
-        return max(0.0, 1.0 - (affected / total))
+        """CCS in [0,1]: 1.0 = perfekt isoliert. Delegate to apoptose_core."""
+        return core_ccs(
+            target_slot_id=target_slot.slot_id,
+            target_tenant_id=target_slot.hotel_id,
+            peers=peer_slots,
+            tenant_attr="hotel_id",
+            health_lookup=self.injector.compute_health,
+            unhealthy_threshold=unhealthy_threshold,
+        )
 
     def bounded_veto_correctness(
         self, outcomes: list[BoundedVetoOutcome]
@@ -158,16 +155,9 @@ class SaeRobustnessMetrics:
     ) -> BoundedVetoOutcome:
         """Erstellt BoundedVetoOutcome durch Vergleich Veto vs Ground-Truth.
 
-        Slot is actually_unhealthy wenn:
-            is_crashed OR is_byzantine OR is_partitioned
-            OR health_score < threshold
-            OR q_norm out of [-2, +2]
+        Ground-truth via apoptose_core.slot_is_actually_unhealthy (Pattern-Core).
         """
-        actually_unhealthy = (
-            slot.is_crashed or slot.is_byzantine or slot.is_partitioned
-            or slot.health_score < unhealthy_threshold
-            or not (-2.0 <= slot.q_norm <= 2.0)
-        )
+        actually_unhealthy = slot_is_actually_unhealthy(slot, unhealthy_threshold)
         return BoundedVetoOutcome(
             decision_id=decision_id, slot_id=slot.slot_id, hotel_id=slot.hotel_id,
             veto_activated=veto_activated,
@@ -177,7 +167,7 @@ class SaeRobustnessMetrics:
 
     @staticmethod
     def variant_deadline_sec(variant: SlotVariant) -> float:
-        """Variant-spezifische Recovery-Deadline (CRUX-Q_0-Maintenance)."""
+        """Variant-spezifische Recovery-Deadline (Domain-Extension)."""
         if variant is SlotVariant.CONSERVATIVE:
             return DEFAULT_RECOVERY_DEADLINE_CONSERVATIVE_SEC
         if variant is SlotVariant.AGGRESSIVE:
