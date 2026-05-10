@@ -179,16 +179,24 @@ class LexVanceComplianceAuditBus:
     def verify_chain(self, mandant_id: str) -> bool:
         """Verify Hash-Chain-Integrity fuer einen mandant_id.
 
-        Returns True if chain is intact, False if any prev_hash mismatch.
+        W47-P1 (V20-F1-Fix): Verify both prev_hash chaining AND SHA256-Recompute
+        ueber Event-Inhalt (verhindert chain-forge by tampered context).
+
+        Returns True if chain is intact, False if any prev_hash mismatch
+        ODER chain_hash != recomputed-SHA256(prev_hash + obligation + context + ts).
         """
         with self._lock:
             mandant_events = [e for e in self._events if e.mandant_id == mandant_id]
         if not mandant_events:
             return True  # empty chain is trivially valid
-        # Check chain order (timestamp ascending, prev_hash chains correctly)
         prev = ""
         for e in sorted(mandant_events, key=lambda x: x.timestamp):
             if e.prev_hash != prev:
+                return False
+            # W47-P1: SHA256-Recompute-Check (anti-tamper)
+            chain_input = f"{prev}|{e.obligation_type.value}|{e.context}|{e.timestamp}".encode("utf-8")
+            recomputed = hashlib.sha256(chain_input).hexdigest()
+            if e.chain_hash != recomputed:
                 return False
             prev = e.chain_hash
         return True

@@ -174,4 +174,31 @@ def test_max_events_fifo_eviction() -> None:
     assert "ctx-1" not in contexts
 
 
+# ---------------------------------------------------------------------------
+# W47-P1 (V20-F1-Fix): SHA256-Recompute-Verify
+# ---------------------------------------------------------------------------
+
+
+def test_w47p1_verify_chain_sha256_recompute() -> None:
+    """W47-P1: verify_chain checkt SHA256-Recompute (anti-tamper)."""
+    bus = LexVanceComplianceAuditBus()
+    bus.publish(LegalObligationType.CONTRACT_REVIEW, "m1", "ctx-original")
+    assert bus.verify_chain("m1") is True
+
+
+def test_w47p1_tampered_context_breaks_chain() -> None:
+    """W47-P1: wenn ein Event mit getampered context im store ist, verify schlaegt fehl.
+
+    Direct-Replace event in self._events with tampered version → recompute mismatch.
+    """
+    import dataclasses
+    from kmo_governance.lexvance_compliance_audit_bus import LegalAuditEvent
+    bus = LexVanceComplianceAuditBus()
+    e1 = bus.publish(LegalObligationType.CONTRACT_REVIEW, "m1", "original-context")
+    # Tamper with context (chain_hash bleibt original)
+    tampered = dataclasses.replace(e1, context="MALICIOUS-CONTEXT")
+    bus._events[0] = tampered
+    assert bus.verify_chain("m1") is False  # SHA256 recompute mismatch
+
+
 # CRUX-MK

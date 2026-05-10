@@ -72,6 +72,8 @@ class GraphityHomeostasisPricing:
         self._setpoint = setpoint
         self._mild_pct = mild_threshold_pct
         self._critical_pct = critical_threshold_pct
+        # W47-P3 (V20-F3): persist history_window for record_sample to use
+        self._history_window = history_window
         self._lock = threading.RLock()
         # Per-book history deques
         self._histories: dict[str, deque] = {}
@@ -79,7 +81,8 @@ class GraphityHomeostasisPricing:
     def record_sample(self, sample: RoyaltySample) -> RoyaltyDecision:
         with self._lock:
             if sample.book_id not in self._histories:
-                self._histories[sample.book_id] = deque(maxlen=5)
+                # W47-P3 (V20-F3-Fix): respect history_window from constructor
+                self._histories[sample.book_id] = deque(maxlen=self._history_window)
             self._histories[sample.book_id].append(sample)
             current = sum(s.royalty_pct for s in self._histories[sample.book_id]) / len(self._histories[sample.book_id])
             deviation = abs(current - self._setpoint) * 100.0 / max(0.0001, self._setpoint)
