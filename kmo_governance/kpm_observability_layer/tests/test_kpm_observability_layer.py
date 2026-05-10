@@ -450,4 +450,35 @@ def test_lock_striping_no_cross_metric_blocking() -> None:
     assert results["b_duration"] > 0
 
 
+# ---------------------------------------------------------------------------
+# Welle-36 K33-Patch: observe_histogram negative-value Pre-Cond
+# ---------------------------------------------------------------------------
+
+
+def test_observe_histogram_negative_value_raises() -> None:
+    """K33 Pre-Cond: negative Werte sind unsinnig (keine negative Latency)."""
+    obs = KPMObservabilityLayer()
+    obs.register_metric(
+        "lat_ms",
+        MetricType.HISTOGRAM,
+        description="Latency",
+    )
+    with pytest.raises(ValueError, match="histogram value must be >= 0"):
+        obs.observe_histogram("lat_ms", -1.0)
+
+
+def test_observe_histogram_zero_allowed() -> None:
+    """K33: Wert 0 ist erlaubt (Edge-Case Boundary)."""
+    obs = KPMObservabilityLayer()
+    obs.register_metric(
+        "lat_ms",
+        MetricType.HISTOGRAM,
+        description="Latency",
+    )
+    obs.observe_histogram("lat_ms", 0.0)
+    buckets = obs.get_histogram_buckets("lat_ms")
+    # +Inf Bucket = total count, 0.0 wird in alle non-negative Buckets gezaehlt
+    assert buckets[float("inf")] == 1
+
+
 # CRUX-MK

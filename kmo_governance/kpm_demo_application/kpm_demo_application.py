@@ -1,9 +1,14 @@
 # [CRUX-MK]
-"""KPM-Demo-Application End-to-End-Pipeline (Welle-31 Phase-24 KMO-vNext).
+"""KPM-Demo-Application End-to-End-Pipeline (Welle-36 Phase-29 V2: 10 Stages).
 
-End-to-End-Orchestrator der 9 KPM-Bio-Pattern-Lift-Module als produktionsnahe
+End-to-End-Orchestrator der 10 KPM-Bio-Pattern-Lift-Module als produktionsnahe
 Trade-Admission-Pipeline. Demonstriert dass die Module orchestriert wie ein
 Trading-Stack zusammenspielen — nicht nur isoliert testbar sind.
+
+V2-Erweiterung Welle-36: Stage 10 (Observability-Tracking) integriert
+kpm_observability_layer (Welle-29) als 10. KPM-Modul. Trade-Latency wird als
+Histogram observed, Trade-Counter incremented, Active-Strategies-Gauge gesetzt.
+Bio-Aequivalent: Vagusnerv-Steady-State-Aggregation auf Trade-Outcomes.
 
 Pipeline-Flow pro submit_trade():
   1. feature_flag_engine.evaluate(flag_id="strategy_<id>", request_id)
@@ -24,6 +29,9 @@ Pipeline-Flow pro submit_trade():
   7. homeostasis_controller.record_allocation(asset_class, allocation_pct)
   8. audit_event_bus.publish(event_type, instrument_id, ...) -> final_audit
   9. distributed_lock_manager.release(...) -> cleanup
+ 10. observability_layer.observe_histogram("trade_latency_ms", elapsed_ms)
+       + inc_counter("trades_total")
+       + set_gauge("active_strategies", N) (periodisch)
 
 Optional chaos_mode=True: chaos_engineering.inject_random(strategy_id)
                           BEVOR Step 6 (Saga). Test-Hook fuer Resilience.
@@ -33,17 +41,19 @@ Threading: alle KPM-Module sind RLock-protected. Pipeline selbst ist
            (instrument_id, position_side) wird durch Lock-Manager
            serialisiert.
 
-Bio-Aequivalent: Komplette Immun-/Kreislauf-/Stoffwechsel-Kaskade einer
-                 lebenden Zelle bei Antigen-Exposition (Trade als Antigen,
-                 Pipeline als 9-stufige Selbstkontrolle).
+Bio-Aequivalent: Komplette Immun-/Kreislauf-/Stoffwechsel-/Vagusnerv-Kaskade
+                 einer lebenden Zelle bei Antigen-Exposition (Trade als
+                 Antigen, Pipeline als 10-stufige Selbstkontrolle inkl.
+                 kontinuierlicher Steady-State-Telemetrie).
 
 CRUX-Bindung:
 - K_0: Multi-Stage-Reject schuetzt vor Half-Open-Orders + Lock-Hijacking +
        Cap-Burst.
 - Q_0: Audit-Trail (decision_path tuple) + frozen-Result fuer
        MiFID-RTS-25 Forensik.
-- I_min: 9-Stages-Pflicht via State-Machine. Jeder REJECT ist deterministisch
-         und reproducible.
+- I_min: 10-Stages-Pflicht via State-Machine. Jeder REJECT ist deterministisch
+         und reproducible. Stage 10 liefert Observability-Telemetrie fuer
+         externes Monitoring (Prometheus-Format).
 - W_0: Lock-Auto-Release bei Saga-Fehler -> kein Working-Capital-Lock.
 
 CRUX-MK
@@ -90,6 +100,10 @@ from ..kpm_saga_orchestrator import (
     SagaPhase,
     SagaState,
     SagaStep,
+)
+from ..kpm_observability_layer import (
+    KPMObservabilityLayer,
+    MetricType,
 )
 from ..kpm_trading_failover import (
     FailoverState,
@@ -298,6 +312,33 @@ class KPMTradeAdmissionPipeline:
         self.chaos = KPMChaosEngineering(
             default_severity=chaos_default_severity,
         )
+
+        # 10. Observability-Layer (Welle-36 V2: 10. KPM-Modul, Vagusnerv-Pattern)
+        # Side-Effect-only: observe_histogram + inc_counter pro Trade in
+        # _build_result() (siehe Stage-10-Hook). Decision-Path bleibt unberuehrt
+        # (alle existing Tests stable). Telemetrie-Daten via export_prometheus().
+        self.observability = KPMObservabilityLayer()
+        self.observability.register_metric(
+            "trade_latency_ms",
+            MetricType.HISTOGRAM,
+            description="Trade-Pipeline End-to-End Latency (ms)",
+            labels=("outcome",),
+        )
+        self.observability.register_metric(
+            "trades_total",
+            MetricType.COUNTER,
+            description="Total trades processed (success + reject)",
+            labels=("outcome",),
+        )
+        self.observability.register_metric(
+            "active_strategies",
+            MetricType.GAUGE,
+            description="Number of registered strategies (primary + standby)",
+        )
+        self.observability.set_gauge(
+            "active_strategies",
+            float(1 + len(standby_strategy_ids)),
+        )
         # Register default-handler fuer alle bekannten Strategien
         for sid in [primary_strategy_id, *standby_strategy_ids]:
             self.chaos.register_strategy(sid, _default_chaos_handler)
@@ -323,8 +364,25 @@ class KPMTradeAdmissionPipeline:
         audit_event_id: Optional[str] = None,
         saga_id: Optional[str] = None,
     ) -> TradeAdmissionResult:
-        """Internal: konstruiert TradeAdmissionResult mit gemessener elapsed_ms."""
+        """Internal: konstruiert TradeAdmissionResult mit gemessener elapsed_ms.
+
+        Stage-10-Hook (Welle-36 V2): Side-Effect Observability-Update.
+        Histogram trade_latency_ms + Counter trades_total werden mit
+        outcome-Label ('success' | 'reject') geschrieben. Failures sind
+        non-fatal (try/except), damit Pipeline-Outcome nicht von Telemetrie
+        abhaengt.
+        """
         elapsed_ms = max(0.0, (time.monotonic() - start_monotonic) * 1000.0)
+        # ----- Stage 10: Observability (Side-Effect, Vagusnerv-Pattern) -----
+        try:
+            outcome = "success" if success else "reject"
+            self.observability.observe_histogram(
+                "trade_latency_ms", elapsed_ms, outcome=outcome,
+            )
+            self.observability.inc_counter("trades_total", outcome=outcome)
+        except Exception:
+            # Telemetrie-Failure darf Pipeline nicht killen.
+            pass
         return TradeAdmissionResult(
             success=success,
             decision_path=tuple(decision_path),

@@ -264,7 +264,14 @@ class KPMObservabilityLayer:
         value: float,
         **label_values: str,
     ) -> None:
-        """Observe einen Wert im Histogram (default-buckets oder per-Metric)."""
+        """Observe einen Wert im Histogram (default-buckets oder per-Metric).
+
+        Pre:
+          - value >= 0 (negative values are nonsensical for histograms,
+            e.g. negative latencies or durations)
+        """
+        if value < 0:
+            raise ValueError(f"histogram value must be >= 0, got {value}")
         spec = self._check_metric_type(metric_name, MetricType.HISTOGRAM)
         key = self._label_key(label_values)
 

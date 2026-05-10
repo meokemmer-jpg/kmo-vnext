@@ -796,4 +796,49 @@ def test_double_release_idempotent():
     assert call_count["n"] == 1  # Counter unveraendert -> idempotent
 
 
+# ---------------------------------------------------------------------------
+# Welle-36 V2: Stage-10 Observability-Tests (Vagusnerv-Pattern)
+# ---------------------------------------------------------------------------
+
+
+def test_stage10_observability_records_trade_latency_histogram() -> None:
+    """Stage-10 Pflicht: trade_latency_ms Histogram bekommt Observation."""
+    pipe = _build_pipeline()
+    _enable_strategy(pipe, PRIMARY)
+    _submit(pipe)
+    buckets = pipe.observability.get_histogram_buckets(
+        "trade_latency_ms", outcome="success",
+    )
+    # +Inf Bucket immer total observation count (Prometheus-Konvention)
+    assert buckets[float("inf")] >= 1
+
+
+def test_stage10_observability_inc_counter_per_trade() -> None:
+    """Stage-10 Pflicht: trades_total Counter wird pro Trade incremented."""
+    pipe = _build_pipeline()
+    _enable_strategy(pipe, PRIMARY)
+    for i in range(3):
+        _submit(pipe, instrument_id=f"INST{i}", client_order_id=f"ord-w36-{i}")
+    snap = pipe.observability.get_metric("trades_total", outcome="success")
+    assert snap.value == 3.0
+
+
+def test_stage10_observability_active_strategies_gauge() -> None:
+    """Stage-10: active_strategies Gauge = primary + standbys."""
+    pipe = _build_pipeline()
+    snap = pipe.observability.get_metric("active_strategies")
+    # PRIMARY + 2 standbys = 3
+    assert snap.value == 3.0
+
+
+def test_stage10_observability_independent_of_outcome() -> None:
+    """Stage-10: auch reject-Pfade erhoehen Counter mit outcome=reject."""
+    pipe = _build_pipeline()
+    # Flag NICHT enablen -> reject in Stage-1
+    result = _submit(pipe, client_order_id="ord-w36-reject", request_id="req-w36-reject")
+    assert result.success is False
+    snap_reject = pipe.observability.get_metric("trades_total", outcome="reject")
+    assert snap_reject.value == 1.0
+
+
 # CRUX-MK
