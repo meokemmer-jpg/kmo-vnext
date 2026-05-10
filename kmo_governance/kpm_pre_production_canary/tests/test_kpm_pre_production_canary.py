@@ -99,4 +99,12 @@ def test_get_deployment_unknown_returns_none() -> None:
     assert c.get_deployment("never-existed") is None
 
 
+def test_w48p5_unique_deployment_ids_same_ms() -> None:
+    """W48-P5 (V20-Race-Risk): UUID-Suffix verhindert Kollision bei gleicher Zeit."""
+    c = KPMPreProductionCanary()
+    d1 = c.deploy_canary("k", "kbase")
+    d2 = c.deploy_canary("k", "kbase")
+    assert d1.deployment_id != d2.deployment_id
+
+
 # CRUX-MK

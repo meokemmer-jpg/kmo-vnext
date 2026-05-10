@@ -133,4 +133,36 @@ def test_release_idempotent_no_lock() -> None:
     assert r.success is True
 
 
+# ---------------------------------------------------------------------------
+# W47-P2 (V20-F2-Fix): COI Retroaktive Pruefung
+# ---------------------------------------------------------------------------
+
+
+def test_w47p2_declare_rival_returns_conflicting_lawyers() -> None:
+    """W47-P2: declare_rival_mandanten erkennt existing locks die jetzt COI sind."""
+    locks = LexVanceDistributedLock()
+    locks.acquire("client-A", "doc1", "draft", "lawyer-x")
+    locks.acquire("client-B", "doc2", "draft", "lawyer-x")
+    # Vor declare: kein conflict
+    # Nach declare: x hatte Locks bei beiden -> retro-conflict
+    conflicts = locks.declare_rival_mandanten("client-A", "client-B")
+    assert "lawyer-x" in conflicts
+
+
+def test_w47p2_no_retro_conflict_returns_empty() -> None:
+    """W47-P2: keine existing locks -> empty tuple."""
+    locks = LexVanceDistributedLock()
+    conflicts = locks.declare_rival_mandanten("client-A", "client-B")
+    assert conflicts == ()
+
+
+def test_w47p2_retro_only_lawyer_at_both_returned() -> None:
+    """W47-P2: nur lawyers die bei BEIDEN Locks halten zaehlen."""
+    locks = LexVanceDistributedLock()
+    locks.acquire("client-A", "doc1", "draft", "alice")
+    locks.acquire("client-B", "doc2", "draft", "bob")
+    conflicts = locks.declare_rival_mandanten("client-A", "client-B")
+    assert conflicts == ()  # alice + bob sind verschiedene lawyers
+
+
 # CRUX-MK

@@ -59,10 +59,12 @@ class LexVanceDistributedLock:
         # Conflict-of-Interest tracking: rival_mandanten_pairs
         self._rival_pairs: set[frozenset[str]] = set()
 
-    def declare_rival_mandanten(self, mandant_a: str, mandant_b: str) -> None:
-        """Mark two mandanten as rivals (conflict-of-interest enforcement).
+    def declare_rival_mandanten(self, mandant_a: str, mandant_b: str) -> tuple[str, ...]:
+        """Mark two mandanten as rivals + retroactive-Check (W47-P2 V20-F2-Fix).
 
         Pre: both non-empty + different
+        Returns: tuple of conflict-violator-keys (lawyer_ids that hold both)
+                 = empty tuple wenn keine retroactive-Verletzung
         """
         if not mandant_a or not mandant_b:
             raise ValueError("both mandant_ids must be non-empty")
@@ -70,6 +72,17 @@ class LexVanceDistributedLock:
             raise ValueError("mandanten must be different")
         with self._lock:
             self._rival_pairs.add(frozenset({mandant_a, mandant_b}))
+            # W47-P2 (V20-F2): retroactive COI-Check
+            # Find lawyers that hold locks at BOTH mandant_a AND mandant_b
+            lawyers_at_a: set[str] = set()
+            lawyers_at_b: set[str] = set()
+            for (mid, _, _), (lawyer_id, _, _) in self._locks.items():
+                if mid == mandant_a:
+                    lawyers_at_a.add(lawyer_id)
+                elif mid == mandant_b:
+                    lawyers_at_b.add(lawyer_id)
+            conflicting_lawyers = tuple(sorted(lawyers_at_a & lawyers_at_b))
+            return conflicting_lawyers
 
     def acquire(
         self,

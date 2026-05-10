@@ -1,9 +1,10 @@
 # [CRUX-MK]
-"""KPM-Pre-Production-Canary Implementation (Welle-45 Phase-38)."""
+"""KPM-Pre-Production-Canary Implementation (Welle-45 Phase-38 + W48-P5)."""
 from __future__ import annotations
 
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -69,7 +70,8 @@ class KPMPreProductionCanary:
     ) -> CanaryDeployment:
         if not 0.0 < capital_pct <= 1.0:
             raise ValueError("capital_pct must be in (0.0, 1.0]")
-        deployment_id = f"canary-{strategy_id}-{int(time.time()*1000)}"
+        # W48-P5 (V20-Race-Risk): UUID-suffix verhindert Same-MS-Kollision
+        deployment_id = f"canary-{strategy_id}-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
         with self._lock:
             d = CanaryDeployment(
                 deployment_id=deployment_id,
