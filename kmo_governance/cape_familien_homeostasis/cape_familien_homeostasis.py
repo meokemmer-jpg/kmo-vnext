@@ -1,5 +1,5 @@
 # [CRUX-MK]
-"""Cape-Familien-Homeostasis Implementation (Welle-38 Phase-31 W38-T2)."""
+"""Cape-Familien-Homeostasis Implementation (Welle-38 Phase-31 W38-T2 + W39-P2)."""
 from __future__ import annotations
 
 import threading
@@ -8,6 +8,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+
+# W39-P2 (Codex V19 W19-I3): Real-L13-Trigger via Audit-Bus.
+# CRITICAL-state publishes l13_phronesis_required event in audit_bus.
+from ..cape_familien_audit_bus import (
+    CapeFamilienAuditBus,
+    ComplianceTag,
+    FamilienDecisionType,
+)
 
 
 class FamilienState(str, Enum):
@@ -88,6 +96,7 @@ class CapeFamilienHomeostasis:
         history_window: int = 5,
         mild_threshold_pct: float = 10.0,
         critical_threshold_pct: float = 20.0,
+        audit_bus: Optional[CapeFamilienAuditBus] = None,
     ) -> None:
         if not 0.0 <= setpoint <= 1.0:
             raise ValueError("setpoint must be in [0.0, 1.0]")
@@ -103,9 +112,15 @@ class CapeFamilienHomeostasis:
         self._lock = threading.RLock()
         self._history: deque = deque(maxlen=history_window)
         self._samples_total = 0
+        # W39-P2: optional audit_bus for L13-Phronesis-Trigger publication
+        self._audit_bus = audit_bus
 
     def record_sample(self, sample: MentalLoadSample) -> FamilienHomeostasisDecision:
-        """Add sample + return current Decision."""
+        """Add sample + return current Decision.
+
+        W39-P2: bei CRITICAL-state publish audit_event via audit_bus
+        (real L13-Phronesis-Trigger statt nur reason-string).
+        """
         with self._lock:
             self._history.append(sample)
             self._samples_total += 1
@@ -113,7 +128,7 @@ class CapeFamilienHomeostasis:
             deviation_pct = abs(current_score - self._setpoint) * 100.0 / max(0.001, self._setpoint)
             state = self._classify(current_score, deviation_pct)
             action = self._build_action(state, current_score, sample.family_member_id)
-            return FamilienHomeostasisDecision(
+            decision = FamilienHomeostasisDecision(
                 state=state,
                 current_score=current_score,
                 setpoint=self._setpoint,
@@ -122,6 +137,24 @@ class CapeFamilienHomeostasis:
                 samples_evaluated=len(self._history),
                 timestamp=time.time(),
             )
+        # W39-P2: ausserhalb _lock publishen (audit_bus hat eigenen Lock, deadlock-Schutz)
+        if state == FamilienState.CRITICAL and self._audit_bus is not None:
+            try:
+                self._audit_bus.publish(
+                    decision_type=FamilienDecisionType.DECISION_FAMILIAL,
+                    family_member_role=sample.family_member_id,
+                    context=f"l13_phronesis_required: deviation={deviation_pct:.1f}% score={current_score:.2f}",
+                    compliance_tags=frozenset({ComplianceTag.FAMILIAL, ComplianceTag.PERSONAL_DATA}),
+                    metadata=(
+                        ("event_type", "l13_phronesis_required"),
+                        ("setpoint", str(self._setpoint)),
+                        ("current_score", str(current_score)),
+                    ),
+                )
+            except Exception:
+                # Audit-Bus-Failure darf record_sample NICHT killen
+                pass
+        return decision
 
     def _rolling_avg(self) -> float:
         if not self._history:

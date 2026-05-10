@@ -125,4 +125,38 @@ def test_normal_to_critical_transition() -> None:
     assert d2.state == FamilienState.CRITICAL
 
 
+# ---------------------------------------------------------------------------
+# W39-P2: Real-L13-Trigger via Audit-Bus (Codex V19 W19-I3)
+# ---------------------------------------------------------------------------
+
+
+def test_w39p2_critical_publishes_l13_event_to_audit_bus() -> None:
+    """W39-P2: CRITICAL state publishes l13_phronesis_required in audit_bus."""
+    from kmo_governance.cape_familien_audit_bus import CapeFamilienAuditBus
+    bus = CapeFamilienAuditBus()
+    h = CapeFamilienHomeostasis(setpoint=0.5, history_window=1, audit_bus=bus)
+    h.record_sample(_sample(0.95))  # CRITICAL deviation
+    events = bus.query()
+    assert len(events) == 1
+    metadata_dict = dict(events[0].metadata)
+    assert metadata_dict["event_type"] == "l13_phronesis_required"
+
+
+def test_w39p2_normal_does_not_publish_l13() -> None:
+    """W39-P2: NORMAL state does NOT trigger L13."""
+    from kmo_governance.cape_familien_audit_bus import CapeFamilienAuditBus
+    bus = CapeFamilienAuditBus()
+    h = CapeFamilienHomeostasis(setpoint=0.5, history_window=1, audit_bus=bus)
+    h.record_sample(_sample(0.5))  # NORMAL
+    events = bus.query()
+    assert len(events) == 0
+
+
+def test_w39p2_no_audit_bus_does_not_crash() -> None:
+    """W39-P2: ohne audit_bus arg -> CRITICAL state laeuft trotzdem ohne Crash."""
+    h = CapeFamilienHomeostasis(setpoint=0.5, history_window=1)
+    decision = h.record_sample(_sample(0.95))
+    assert decision.state == FamilienState.CRITICAL  # state-logic unverändert
+
+
 # CRUX-MK

@@ -274,4 +274,41 @@ def test_register_empty_manuscript_id_raises() -> None:
         chaos.register_manuscript("", _ok_handler)
 
 
+# ---------------------------------------------------------------------------
+# W39-P1+P3 Patches (Codex V19 W19-I3 + W19-Race-Risk)
+# ---------------------------------------------------------------------------
+
+
+def test_w39p1_stability_decay_capped_at_005() -> None:
+    """W39-P1: Stability-Decay capped bei 0.05 pro Fault, auch bei CRITICAL."""
+    chaos = GraphityChaosEngineering()
+    chaos.register_manuscript("manu-001", _fail_handler)
+    initial = chaos.get_stability_score("manu-001")  # 1.0
+    chaos.inject(_scenario(severity=FaultSeverity.CRITICAL))
+    after = chaos.get_stability_score("manu-001")
+    decay = initial - after
+    assert decay <= 0.0501  # capped (float-Toleranz), NICHT 0.75 (15.0 * 0.05) wie vorher
+    assert decay > 0.0
+
+
+def test_w39p3_failed_outcome_paused_appended_to_history() -> None:
+    """W39-P3: paused-Outcomes werden in history appended (Audit-Trail-Voll)."""
+    chaos = GraphityChaosEngineering()
+    chaos.register_manuscript("manu-001", _ok_handler)
+    chaos.pause_chaos()
+    chaos.inject(_scenario())  # paused -> failed_outcome
+    outcomes = chaos.get_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0].error == "chaos_paused"
+
+
+def test_w39p3_failed_outcome_unregistered_appended_to_history() -> None:
+    """W39-P3: unregistered-manuscript-Outcomes in history."""
+    chaos = GraphityChaosEngineering()
+    chaos.inject(_scenario(manuscript_id="never-registered"))
+    outcomes = chaos.get_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0].error == "manuscript_not_registered"
+
+
 # CRUX-MK

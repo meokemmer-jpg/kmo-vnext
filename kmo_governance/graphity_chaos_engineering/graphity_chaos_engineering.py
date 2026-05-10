@@ -228,9 +228,11 @@ class GraphityChaosEngineering:
         with self._lock:
             self._active_chaos -= 1
             self._outcomes.append(outcome)
-            # Stability-Decay: severity-multiplier * 0.05
+            # W39-P1: Stability-Decay-Cap (Codex V19 finding W19-I3).
+            # Vorher: severity_multiplier * 0.05 → critical=15.0 * 0.05 = 0.75 (massiv).
+            # Jetzt: cap bei 0.05 pro Fault, severity beeinflusst nur Recovery-Erwartung.
             multiplier = SEVERITY_RECOVERY_MULTIPLIER[scenario.severity.value]
-            decay = multiplier * 0.05
+            decay = min(0.05, multiplier * 0.01)  # capped, severity-skaled subtler
             current = self._stability.get(scenario.manuscript_id, 1.0)
             self._stability[scenario.manuscript_id] = max(0.0, current - decay)
             if outcome.success and outcome.editorial_consensus_recovered:
@@ -247,8 +249,13 @@ class GraphityChaosEngineering:
         scenario: GraphityChaosScenario,
         reason: str,
     ) -> GraphityChaosOutcome:
-        """Internal: build failure-outcome ohne Lock-Held."""
-        return GraphityChaosOutcome(
+        """Internal: build failure-outcome + append to history (W39-P3).
+
+        Codex V19 finding W19-I3: failed-pre-cond outcomes wurden nicht in
+        history appended (paused/unregistered/max-concurrent). Jetzt: alle
+        Outcomes (success+failed) in deque fuer Audit-Trail-Vollstaendigkeit.
+        """
+        outcome = GraphityChaosOutcome(
             outcome_id=str(uuid.uuid4()),
             scenario_id=scenario.scenario_id,
             fault_type=scenario.fault_type,
@@ -261,6 +268,9 @@ class GraphityChaosEngineering:
             timestamp=time.time(),
             error=reason,
         )
+        with self._lock:
+            self._outcomes.append(outcome)
+        return outcome
 
     def get_stability_score(self, manuscript_id: str) -> float:
         """Stability [0.0-1.0] fuer Manuscript (1.0 = perfect)."""
