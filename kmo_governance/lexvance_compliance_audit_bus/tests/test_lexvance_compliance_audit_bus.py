@@ -201,4 +201,57 @@ def test_w47p1_tampered_context_breaks_chain() -> None:
     assert bus.verify_chain("m1") is False  # SHA256 recompute mismatch
 
 
+# ---------------------------------------------------------------------------
+# Welle-50 (V21-P2): External-Anchor-Stub
+# ---------------------------------------------------------------------------
+
+
+def test_w50_daily_checkpoint_returns_snapshot() -> None:
+    """Welle-50: daily_checkpoint liefert mandant-chain-snapshot."""
+    bus = LexVanceComplianceAuditBus()
+    bus.publish(LegalObligationType.CONTRACT_REVIEW, "m1", "ctx")
+    snap = bus.daily_checkpoint("2026-05-10")
+    assert snap["date"] == "2026-05-10"
+    assert "m1" in snap["last_chain_hashes"]
+    assert snap["event_count"] == 1
+
+
+def test_w50_daily_checkpoint_invokes_callback() -> None:
+    """Welle-50: callback wird aufgerufen mit snapshot."""
+    received = {}
+    def fake_anchor(snap):
+        received.update(snap)
+    bus = LexVanceComplianceAuditBus(external_anchor_callback=fake_anchor)
+    bus.publish(LegalObligationType.CONTRACT_REVIEW, "m1", "ctx")
+    bus.daily_checkpoint("2026-05-10")
+    assert received["date"] == "2026-05-10"
+
+
+def test_w50_callback_failure_does_not_crash() -> None:
+    """Welle-50: callback-Exception wird gefangen + status loggt fail."""
+    def boom(snap):
+        raise RuntimeError("network down")
+    bus = LexVanceComplianceAuditBus(external_anchor_callback=boom)
+    bus.publish(LegalObligationType.CONTRACT_REVIEW, "m1", "ctx")
+    snap = bus.daily_checkpoint("2026-05-10")
+    assert "callback_failed" in snap["anchor_status"]
+
+
+def test_w50_anchor_history_persistence() -> None:
+    """Welle-50: snapshots in anchor_history persistiert."""
+    bus = LexVanceComplianceAuditBus()
+    bus.publish(LegalObligationType.CONTRACT_REVIEW, "m1", "ctx-1")
+    bus.daily_checkpoint("2026-05-10")
+    bus.publish(LegalObligationType.CONTRACT_REVIEW, "m1", "ctx-2")
+    bus.daily_checkpoint("2026-05-11")
+    history = bus.get_anchor_history()
+    assert len(history) == 2
+
+
+def test_w50_checkpoint_validation() -> None:
+    bus = LexVanceComplianceAuditBus()
+    with pytest.raises(ValueError):
+        bus.daily_checkpoint("")
+
+
 # CRUX-MK

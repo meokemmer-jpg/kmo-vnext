@@ -1,8 +1,13 @@
 # [CRUX-MK]
-"""LexVance-Compliance-Audit-Bus Implementation (Welle-40 Phase-33).
+"""LexVance-Compliance-Audit-Bus Implementation (Welle-40 + W47-P1 + Welle-50 External-Anchor-Stub).
 
 8. Domain (Legal-Compliance) Bio-Pattern-Lift. Hash-Chain + Jurisdiction-aware
-Retention + RLock-protected. Pattern: Lymphatic-System.
+Retention + RLock-protected + External-Anchor-Stub. Pattern: Lymphatic-System.
+
+Welle-50 (V21-P2): External-Anchor-Stub-Mechanik via Daily-Checkpoint.
+- daily_checkpoint() liefert (date, last_chain_hash_per_mandant) snapshot
+- Production: external_anchor_callback (RFC3161/GitHub-Push) wird mit Snapshot aufgerufen
+- Stub-Pattern erlaubt Live-Wiring spaeter ohne Architektur-Aenderung
 """
 from __future__ import annotations
 
@@ -97,6 +102,7 @@ class LexVanceComplianceAuditBus:
         self,
         max_events: int = 10000,
         default_jurisdiction: Jurisdiction = Jurisdiction.DE,
+        external_anchor_callback: Optional[callable] = None,
     ) -> None:
         if max_events < 1:
             raise ValueError("max_events must be >= 1")
@@ -104,6 +110,11 @@ class LexVanceComplianceAuditBus:
             raise TypeError("default_jurisdiction must be Jurisdiction")
         self._max_events = max_events
         self._default_jurisdiction = default_jurisdiction
+        # Welle-50 (V21-P2): external_anchor_callback receives (date, last_chain_hashes_dict)
+        # Production-Wiring: RFC3161-FreeTSA, GitHub-Push, S3-Object-Lock per
+        # rules/external-anchor-requirement-audit-logs.md
+        self._external_anchor_callback = external_anchor_callback
+        self._anchor_history: list[dict] = []  # daily-checkpoint snapshots
         self._lock = threading.RLock()
         # event-store: list (chronological)
         self._events: list[LegalAuditEvent] = []
@@ -215,6 +226,40 @@ class LexVanceComplianceAuditBus:
                     removed += 1
             self._events = keep
         return removed
+
+    def daily_checkpoint(self, date_iso: str) -> dict:
+        """Welle-50 (V21-P2): Daily-Anchor-Checkpoint snapshot.
+
+        Returns: {'date': iso, 'last_chain_hashes': dict[mandant_id, chain_hash], 'event_count': int}
+        Side-effect: ruft external_anchor_callback(snapshot) auf wenn gesetzt.
+                     Persistiert snapshot in _anchor_history fuer Audit-Trail.
+
+        Production-Wiring: callback fuehrt RFC3161-FreeTSA-Stamp ODER GitHub-Push aus.
+
+        Pre: date_iso non-empty.
+        """
+        if not date_iso:
+            raise ValueError("date_iso must be non-empty")
+        with self._lock:
+            snapshot = {
+                "date": date_iso,
+                "last_chain_hashes": dict(self._last_chain_hash),
+                "event_count": len(self._events),
+                "anchor_status": "stub",  # production: "rfc3161" / "github" / "s3"
+            }
+            self._anchor_history.append(snapshot)
+            if self._external_anchor_callback is not None:
+                try:
+                    self._external_anchor_callback(snapshot)
+                    snapshot["anchor_status"] = "callback_invoked"
+                except Exception as exc:
+                    snapshot["anchor_status"] = f"callback_failed: {type(exc).__name__}"
+        return snapshot
+
+    def get_anchor_history(self) -> tuple[dict, ...]:
+        """Welle-50: Anchor-History fuer Audit-Trail."""
+        with self._lock:
+            return tuple(self._anchor_history)
 
     def get_stats(self) -> dict:
         """Aggregate-Stats (total events, per-jurisdiction, per-obligation)."""
