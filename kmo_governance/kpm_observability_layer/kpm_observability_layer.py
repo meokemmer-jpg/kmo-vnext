@@ -270,6 +270,12 @@ class KPMObservabilityLayer:
           - value >= 0 (negative values are nonsensical for histograms,
             e.g. negative latencies or durations)
         """
+        # K33+W18-P1: reject negative, NaN, +/-Inf (Codex V18 NaN/+Inf-Leak fix)
+        import math
+        if math.isnan(value):
+            raise ValueError("histogram value must not be NaN")
+        if math.isinf(value):
+            raise ValueError("histogram value must not be +/-Infinity")
         if value < 0:
             raise ValueError(f"histogram value must be >= 0, got {value}")
         spec = self._check_metric_type(metric_name, MetricType.HISTOGRAM)

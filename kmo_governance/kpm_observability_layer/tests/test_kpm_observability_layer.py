@@ -467,6 +467,26 @@ def test_observe_histogram_negative_value_raises() -> None:
         obs.observe_histogram("lat_ms", -1.0)
 
 
+def test_observe_histogram_nan_raises() -> None:
+    """W18-P1 (Codex): NaN ist unsinnig fuer Histogram, raises ValueError."""
+    import math
+    obs = KPMObservabilityLayer()
+    obs.register_metric("lat_ms", MetricType.HISTOGRAM, description="Latency")
+    with pytest.raises(ValueError, match="must not be NaN"):
+        obs.observe_histogram("lat_ms", math.nan)
+
+
+def test_observe_histogram_infinity_raises() -> None:
+    """W18-P1 (Codex): +/-Infinity ist unsinnig (would corrupt histogram_sum)."""
+    import math
+    obs = KPMObservabilityLayer()
+    obs.register_metric("lat_ms", MetricType.HISTOGRAM, description="Latency")
+    with pytest.raises(ValueError, match="must not be \\+/-Infinity"):
+        obs.observe_histogram("lat_ms", math.inf)
+    with pytest.raises(ValueError, match="must not be \\+/-Infinity"):
+        obs.observe_histogram("lat_ms", -math.inf)
+
+
 def test_observe_histogram_zero_allowed() -> None:
     """K33: Wert 0 ist erlaubt (Edge-Case Boundary)."""
     obs = KPMObservabilityLayer()
