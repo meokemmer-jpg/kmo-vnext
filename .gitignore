@@ -37,3 +37,10 @@ data/
 dist/
 build/
 *.egg-info/
+*.db
+*.sqlite
+*.sqlite3
+*.key
+*.pem
+secrets.json
+credentials.json

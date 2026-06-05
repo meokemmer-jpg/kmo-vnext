@@ -1,0 +1,80 @@
+# KMO Hot-Switch-Multi-Adapter Configuration [CRUX-MK]
+module_id: kmo-hot-switch-adapter
+version: 0.1.0-PHASE-1
+crux-mk: true
+
+description: |
+  Multi-Adapter-Router (Apaleo/Mews/Cloudbeds) mit Circuit-Breaker + Failover.
+  Pro Tenant eigene Router-Instanz (keine Cross-Tenant-Kontamination).
+  Anti-Pattern: Tenant-Hardcoding in Adapter-Code (verboten).
+
+k11_cascade_containment:
+  cascade_isolation: hard
+  failure_blast_radius: 0  # Adapter-Failure isoliert pro Tenant
+  dependency_dlq_strategy: "Fallback-Chain pro Tenant + jsonl-Backup"
+
+k12_distillation_resistenz:
+  output_feeds_into_training: false
+  provenance_required_in_output: true
+  non_llm_validation_layer: state-machine-circuit-breaker
+  cryptographic_signature: false  # Adapter-Calls sind nicht-Distillation-relevant
+
+k13_independent_ground_truth:
+  external_anchor_type: drive_filesystem  # Health-State + Audit-Log
+  external_anchor_validation_frequency: "per-call atomic"
+  pre_action_domain_check:
+    env_tag: "dev/staging/prod check pre-call"
+    tenant_isolation: "Router pro Tenant, keine shared State"
+  pre_action_check_failure: "HARD-STOP, kein Auto-Override"
+
+k14_human_override_decay:
+  override_complexity: single_command  # force_close pro Adapter
+  martin_review_cadence: "weekly Adapter-Health-Report"
+
+k15_entropy_budget:
+  entropy_added_loc_estimate: 700
+  entropy_added_concepts:
+    - AdapterHealthMonitor
+    - CircuitState (3-State)
+    - MultiAdapterRouter
+    - FailoverOrchestrator
+    - AdapterCallResult
+  entropy_justified_by_rho: "Hot-Switch verhindert Tenant-Downtime + Adapter-Vendor-Lock"
+
+k16_concurrent_spawn_mutex:
+  concurrent_spawn_protection: both
+  lock_dir: /tmp/kmo-hot-switch-adapter.lock
+
+lose_coupling:
+  LC1_graceful_degradation:
+    degradation_modes:
+      - full        # alle 3 Adapter (Apaleo+Mews+Cloudbeds) verfuegbar
+      - degraded_2  # nur 2 Adapter live
+      - degraded_1  # nur 1 Adapter live
+      - standalone  # local cache only (read-only)
+    degradation_test_required: true
+  LC2_direct_mode:
+    direct_mode_available: true
+    direct_mode_capability: 0.40  # local-cache read-only
+    direct_mode_trigger: "alle Adapter unavailable"
+  LC3_circuit_breaker:
+    circuit_breaker_timeout_s: 30
+    circuit_breaker_open_threshold: 3
+    circuit_breaker_half_open_test_interval_s: 30
+  LC4_failure_isolation:
+    state_externalization: true
+    idempotent_operations: true
+    dependency_dlq_separate: true  # eigene DLQ pro Adapter
+  LC5_health_check:
+    health_check_endpoint_or_file: "/tmp/kmo-hot-switch-health.json"
+
+operations:
+  output_path: ~/Projects/dark-factories/kmo/kmo_governance/hot_switch_adapter/
+  jsonl_backup_path: ~/.kmo-governance/adapter-events.jsonl
+  stop_flag_path: /tmp/kmo-hot-switch-adapter.stop
+
+crux_bindung:
+  K_0: "geschuetzt - Hot-Switch verhindert Tenant-Downtime bei Adapter-Outages"
+  Q_0: "erhoeht (Circuit-Breaker + Health-Monitoring + per-Tenant-Isolation)"
+  I_min: "strukturierte 3-Adapter-Failover-Logic"
+  W_0: "Adapter-Vendor-Independence reduziert Lock-In + Auto-Failover"

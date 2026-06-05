@@ -1,0 +1,81 @@
+# KMO Multi-Tenant-Approval-Gate Configuration [CRUX-MK]
+module_id: kmo-multi-tenant-approval
+version: 0.1.0-PHASE-1
+crux-mk: true
+
+description: |
+  Approval-Gate fuer Tenant-spezifische Operationen mit Pre-Action-Check.
+  Kombiniert PocketOS-Lehre (env_tag/blast_radius/reversibility) mit
+  Multi-Tenant-Policy (Cross-Tenant-Sharing, Phronesis-Hard-No-Delegate).
+
+k11_cascade_containment:
+  cascade_isolation: hard
+  failure_blast_radius: 0
+  dependency_dlq_strategy: "Pending-Requests in jsonl-Backup"
+
+k12_distillation_resistenz:
+  output_feeds_into_training: false
+  provenance_required_in_output: true
+  non_llm_validation_layer: rule-based-policy-engine
+  cryptographic_signature: true
+
+k13_independent_ground_truth:
+  external_anchor_type: legal_document_source  # Tenant-Contract + DSGVO
+  external_anchor_validation_frequency: "per-request synchronous check"
+  pre_action_domain_check:
+    env_tag: "dev/staging/prod check pre-approval (Pflicht)"
+    blast_radius: "max betroffene Tenants/Records"
+  pre_action_backup_check:
+    backup_status: "approval_request jsonl-backup pre-decision"
+  pre_action_blast_radius_check:
+    blast_radius: "PROD_BLOCK >=5000, PROD_ESCALATE >=100"
+    reversibility_class: "state-only/side-effect/non-reversible"
+  pre_action_check_failure: "HARD-STOP, kein Auto-Override"
+
+k14_human_override_decay:
+  override_complexity: single_command
+  martin_review_cadence: "weekly Approval-Health-Report"
+
+k15_entropy_budget:
+  entropy_added_loc_estimate: 500
+  entropy_added_concepts:
+    - ApprovalRequest
+    - ApprovalStatus (5-State)
+    - OperationCategory (6-Kategorien)
+    - PreActionCheck
+  entropy_justified_by_rho: "Multi-Tenant-Onboarding skaliert mit deterministischer Approval-Logic"
+
+k16_concurrent_spawn_mutex:
+  concurrent_spawn_protection: both
+  lock_dir: /tmp/kmo-approval-gate.lock
+
+lose_coupling:
+  LC1_graceful_degradation:
+    degradation_modes:
+      - full
+      - degraded_no_phronesis  # Phronesis-Notify ausser Reach
+      - standalone_jsonl_only
+    degradation_test_required: true
+  LC2_direct_mode:
+    direct_mode_available: true
+    direct_mode_capability: 0.85
+    direct_mode_trigger: "policy-engine unreachable >30s"
+  LC3_circuit_breaker:
+    circuit_breaker_timeout_s: 30
+    circuit_breaker_open_threshold: 3
+  LC4_failure_isolation:
+    state_externalization: true
+    idempotent_operations: true
+  LC5_health_check:
+    health_check_endpoint_or_file: "/tmp/kmo-approval-health.json"
+
+operations:
+  output_path: ~/Projects/dark-factories/kmo/kmo_governance/multi_tenant_approval/
+  jsonl_backup_path: ~/.kmo-governance/approval-events.jsonl
+  stop_flag_path: /tmp/kmo-approval-gate.stop
+
+crux_bindung:
+  K_0: "DIREKT GESCHUETZT - Approval-Gate verhindert ungewollte Multi-Tenant-Operationen"
+  Q_0: "erhoeht (Phronesis-Hard-No-Delegate + Audit-Trail)"
+  I_min: "strukturierte Policy-Logic"
+  W_0: "Approval-Automatisierung reduziert Martin-Review-Bedarf auf Phronesis-Faelle"

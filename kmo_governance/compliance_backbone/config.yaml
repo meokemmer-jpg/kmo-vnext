@@ -1,0 +1,77 @@
+# KMO Compliance-Backbone-Layer Configuration [CRUX-MK]
+module_id: kmo-compliance-backbone
+version: 0.1.0-PHASE-1
+crux-mk: true
+
+description: |
+  Mock-Integration mit DF-W8-11-DSGVO-Auditor + DPIA-per-Tenant Lifecycle.
+  Phase-1: Mock-Auditor. Phase-2: direkter DF-W8-11-Import.
+
+k11_cascade_containment:
+  cascade_isolation: hard
+  failure_blast_radius: 0
+  dependency_dlq_strategy: "Compliance-Failures werden geloggt, nicht propagiert"
+
+k12_distillation_resistenz:
+  output_feeds_into_training: false
+  provenance_required_in_output: true
+  non_llm_validation_layer: rule-based-via-DF-W8-11
+  cryptographic_signature: true
+
+k13_independent_ground_truth:
+  external_anchor_type: legal_document_source
+  external_anchor_validation_frequency: "monthly law-text + per-check ground-truth"
+  pre_action_domain_check:
+    env_tag: "dev/staging/prod check pre-compliance-call"
+  pre_action_check_failure: "HARD-STOP, kein Auto-Override"
+
+k14_human_override_decay:
+  override_complexity: single_command
+  martin_review_cadence: "weekly Compliance-Trend-Review"
+
+k15_entropy_budget:
+  entropy_added_loc_estimate: 700
+  entropy_added_concepts:
+    - ComplianceOrchestrator
+    - ComplianceCheckResult
+    - DPIAPerTenant (4-State-Lifecycle)
+    - RiskLevel (4-Stufen)
+  entropy_justified_by_rho: "Multi-Tenant-DSGVO-Audits skalieren via DPIA-pro-Tenant"
+
+k16_concurrent_spawn_mutex:
+  concurrent_spawn_protection: both
+  lock_dir: /tmp/kmo-compliance-backbone.lock
+
+lose_coupling:
+  LC1_graceful_degradation:
+    degradation_modes:
+      - full
+      - degraded_mock_auditor  # DF-W8-11 nicht erreichbar -> Mock
+      - standalone_jsonl_only
+    degradation_test_required: true
+  LC2_direct_mode:
+    direct_mode_available: true
+    direct_mode_capability: 0.65
+    direct_mode_trigger: "DF-W8-11 unreachable >30s"
+  LC3_circuit_breaker:
+    circuit_breaker_timeout_s: 30
+    circuit_breaker_open_threshold: 3
+  LC4_failure_isolation:
+    state_externalization: true
+    idempotent_operations: true
+  LC5_health_check:
+    health_check_endpoint_or_file: "/tmp/kmo-compliance-backbone-health.json"
+
+operations:
+  output_path: ~/Projects/dark-factories/kmo/kmo_governance/compliance_backbone/
+  jsonl_backup_path: ~/.kmo-governance/compliance-events.jsonl
+  stop_flag_path: /tmp/kmo-compliance-backbone.stop
+
+dependencies_phase_2:
+  - DF-W8-11  # DSGVO-Privacy-Auditor (real Import statt Mock)
+
+crux_bindung:
+  K_0: "DIREKT GESCHUETZT - Compliance-Strafe-Vermeidung pro Tenant"
+  Q_0: "erhoeht (DPIA-Lifecycle + Provenance pro Tenant)"
+  I_min: "strukturierte Compliance-Orchestrierung"
+  W_0: "Tenant-Compliance ohne Martin-Review pro Audit"

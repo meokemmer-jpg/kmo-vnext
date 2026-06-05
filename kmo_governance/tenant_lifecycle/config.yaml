@@ -1,0 +1,96 @@
+# KMO Tenant-Lifecycle Module Configuration [CRUX-MK]
+# Welle-11-E1 Multi-Tenant-Erweiterung
+module_id: kmo-tenant-lifecycle
+version: 0.1.0-PHASE-1
+crux-mk: true
+
+description: |
+  Tenant-Lifecycle-State-Machine fuer Multi-Tenant-Hotelier-Onboarding.
+  PROVISIONED -> ACTIVE -> SUSPENDED? -> DECOMMISSIONED -> ARCHIVED.
+  K12 Distillation-Resistenz via canonical_record_hash.
+
+# === K11-K16 Akzeptanz-Kriterien ===
+
+k11_cascade_containment:
+  cascade_isolation: hard
+  failure_blast_radius: 0
+  dependency_dlq_strategy: "DLQ pro Lifecycle-Event in jsonl-Backup"
+
+k12_distillation_resistenz:
+  output_feeds_into_training: false
+  provenance_required_in_output: true
+  non_llm_validation_layer: rule-based-state-machine
+  cryptographic_signature: true
+
+k13_independent_ground_truth:
+  external_anchor_type: drive_filesystem  # SQLite + jsonl-Backup
+  external_anchor_validation_frequency: "per-write atomic-flush"
+  pre_action_domain_check:
+    env_tag: "dev/staging/prod check pre-state-transition"
+    mount_point: "SQLite-DB-Path + jsonl-Backup-Path"
+  pre_action_backup_check:
+    backup_status: "jsonl-Backup pre-each-state-write"
+  pre_action_blast_radius_check:
+    blast_radius: "1 Tenant pro Transition (idempotent)"
+    reversibility_class: "state-only (rollback via log_transition)"
+  pre_action_check_failure: "HARD-STOP, kein Auto-Override"
+
+k14_human_override_decay:
+  override_complexity: single_command  # STOP.flag
+  override_documentation_freshness_days: 30
+  martin_review_cadence: "weekly Tenant-Lifecycle-Health-Report"
+
+k15_entropy_budget:
+  entropy_added_loc_estimate: 600
+  entropy_added_concepts:
+    - Tenant
+    - TenantStatus (5-State-Machine)
+    - PlanTier
+    - LifecycleTransition
+  entropy_justified_by_rho: "Multi-Tenant-Onboarding skaliert via deterministischer State-Machine"
+  entropy_subtractive_potential: "ersetzt manuelle Tenant-Provisioning"
+
+k16_concurrent_spawn_mutex:
+  concurrent_spawn_protection: both
+  lock_dir: /tmp/kmo-tenant-lifecycle.lock
+  lock_stale_age_h: 6
+
+# === LC1-LC5 Lose-Coupling ===
+
+lose_coupling:
+  LC1_graceful_degradation:
+    degradation_modes:
+      - full
+      - degraded_db_write_only_jsonl
+      - standalone_in_memory
+    degradation_test_required: true
+  LC2_direct_mode:
+    direct_mode_available: true
+    direct_mode_capability: 0.80
+    direct_mode_trigger: "sqlite-db unreachable >30s"
+  LC3_circuit_breaker:
+    circuit_breaker_timeout_s: 30
+    circuit_breaker_open_threshold: 3
+    circuit_breaker_half_open_test_interval_s: 300
+  LC4_failure_isolation:
+    state_externalization: true
+    idempotent_operations: true
+    dependency_dlq_separate: true
+  LC5_health_check:
+    health_check_dependencies: []
+    health_check_degraded_score: 0.7
+    health_check_endpoint_or_file: "/tmp/kmo-tenant-lifecycle-health.json"
+
+# === Operatives ===
+operations:
+  output_path: ~/Projects/dark-factories/kmo/kmo_governance/tenant_lifecycle/
+  sqlite_db_path: ~/.kmo-governance/tenant-lifecycle.db
+  jsonl_backup_path: ~/.kmo-governance/tenant-events.jsonl
+  stop_flag_path: /tmp/kmo-tenant-lifecycle.stop
+
+# === CRUX-Bindung ===
+crux_bindung:
+  K_0: "geschuetzt (saubere Tenant-Provisioning verhindert versehentliche Cross-Tenant-Lecks)"
+  Q_0: "erhoeht (deterministische State-Machine + Audit-Log)"
+  I_min: "strukturierte 5-State-Machine + K11-K16 + LC1-LC5"
+  W_0: "Multi-Tenant-Onboarding skaliert ohne Martin-Review pro Tenant"

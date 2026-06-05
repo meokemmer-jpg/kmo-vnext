@@ -1,0 +1,78 @@
+# KMO Cross-Tenant-Data-Sharing-Filter Configuration [CRUX-MK]
+module_id: kmo-cross-tenant-filter
+version: 0.1.0-PHASE-1
+crux-mk: true
+
+description: |
+  PolicyDecisionPoint + AnonymizationLayer fuer Cross-Tenant-Data-Sharing.
+  Default DENY. k>=5 Anonymity-Pflicht fuer non-PUBLIC Daten.
+  Anti-Pattern: Cross-Tenant-Queries ohne Audit + Tenant-Hardcoding.
+
+k11_cascade_containment:
+  cascade_isolation: hard
+  failure_blast_radius: 0
+  dependency_dlq_strategy: "Sharing-Decisions in jsonl-Backup"
+
+k12_distillation_resistenz:
+  output_feeds_into_training: false
+  provenance_required_in_output: true
+  non_llm_validation_layer: rule-based-policy-engine
+  cryptographic_signature: true
+
+k13_independent_ground_truth:
+  external_anchor_type: legal_document_source  # DSGVO Art 5 + Art 25
+  external_anchor_validation_frequency: "per-decision synchronous policy-check"
+  pre_action_domain_check:
+    env_tag: "dev/staging/prod check pre-decision"
+    tenant_isolation_check: "source_tenant_id != target_tenant_id Pflicht (ausser self-access)"
+  pre_action_check_failure: "HARD-STOP, kein Auto-Override"
+
+k14_human_override_decay:
+  override_complexity: single_command
+  martin_review_cadence: "weekly Sharing-Audit-Report"
+
+k15_entropy_budget:
+  entropy_added_loc_estimate: 600
+  entropy_added_concepts:
+    - PolicyDecisionPoint
+    - SharingPolicy
+    - SharingRequest
+    - DataSensitivity (5-Stufen)
+    - k-Anonymity-Test
+  entropy_justified_by_rho: "Cross-Tenant-Sharing skaliert nur mit deterministischer Policy"
+
+k16_concurrent_spawn_mutex:
+  concurrent_spawn_protection: both
+  lock_dir: /tmp/kmo-cross-tenant-filter.lock
+
+lose_coupling:
+  LC1_graceful_degradation:
+    degradation_modes:
+      - full
+      - degraded_default_deny  # Policy-Engine versagt -> DENY all
+      - standalone
+    degradation_test_required: true
+  LC2_direct_mode:
+    direct_mode_available: true
+    direct_mode_capability: 0.50  # bei Failure: DENY all (sicher)
+    direct_mode_trigger: "policy-engine unreachable"
+  LC3_circuit_breaker:
+    circuit_breaker_timeout_s: 30
+    circuit_breaker_open_threshold: 3
+  LC4_failure_isolation:
+    state_externalization: true
+    idempotent_operations: true
+  LC5_health_check:
+    health_check_endpoint_or_file: "/tmp/kmo-cross-tenant-filter-health.json"
+
+operations:
+  output_path: ~/Projects/dark-factories/kmo/kmo_governance/cross_tenant_filter/
+  jsonl_backup_path: ~/.kmo-governance/cross-tenant-events.jsonl
+  stop_flag_path: /tmp/kmo-cross-tenant-filter.stop
+  k_anonymity_threshold: 5
+
+crux_bindung:
+  K_0: "DIREKT GESCHUETZT - Verhindert Cross-Tenant-Daten-Lecks"
+  Q_0: "DIREKT GESCHUETZT - k>=5 Anonymity erhaelt Privatsphaere"
+  I_min: "strukturierte Policy-Engine"
+  W_0: "automatisierte Sharing-Decisions ohne Martin-Review pro Request"
