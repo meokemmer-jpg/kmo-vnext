@@ -2,10 +2,16 @@
 """DAX-EOD-Daten-Ingestion fuer KPM-Backtests (W70-CROWN AP-K2).
 
 Zwei KEYLESS-Quellen (kein API-Key, kein Scraping-Framework, nur stdlib):
-    Quelle 1 (primaer):   stooq.com CSV-Endpoint
-                          https://stooq.com/q/d/l/?s=^dax&i=d
-    Quelle 2 (sekundaer): Yahoo Finance v8 Chart-JSON-Endpoint (^GDAXI)
+    Quelle 1 (primaer):   Yahoo Finance v8 Chart-JSON-Endpoint (^GDAXI)
                           https://query1.finance.yahoo.com/v8/finance/chart/^GDAXI
+    Quelle 2 (sekundaer): Onvista EOD-History-JSON (DAX, Xetra, idNotation 20735)
+                          https://api.onvista.de/api/v1/instruments/INDEX/20735/eod_history
+
+QUELLEN-HISTORIE (ehrlich dokumentiert): Die Spec (W70-crown.md AP-K2) nannte
+stooq.com als bewaehrten Primaer-Endpoint. Befund 2026-07-10: stooq liefert auf
+dem CSV-Endpoint eine JavaScript-Proof-of-Work-Bot-Challenge statt Daten.
+Diese Anti-Bot-Massnahme wird NICHT umgangen (Q_0). Ersatz: Yahoo + Onvista,
+beide live verifiziert, provider-unabhaengig voneinander.
 
 Design:
 - Lokaler CSV-Cache in kpm_backtest/data/ (committed — Reproduzierbarkeit).
@@ -42,16 +48,16 @@ __all__ = [
     "PriceBar",
     "QualityReport",
     "CrossValidationReport",
-    "STOOQ_URL",
     "YAHOO_URL",
+    "ONVISTA_EOD_URL_TEMPLATE",
     "MIN_START_DATE",
     "MIN_TRADING_DAYS",
     "CROSS_VALIDATION_TOLERANCE_PCT",
     "GAP_FLAG_TRADING_DAYS",
-    "parse_stooq_csv",
     "parse_yahoo_json",
-    "fetch_stooq",
+    "parse_onvista_json",
     "fetch_yahoo",
+    "fetch_onvista",
     "quality_check",
     "cross_validate",
     "write_cache",
@@ -65,18 +71,30 @@ logger = logging.getLogger(__name__)
 # (date, open, high, low, close) — EOD-Bar, Preise in Indexpunkten
 PriceBar = Tuple[date, float, float, float, float]
 
-# Quelle 1: stooq.com — keyless CSV, DAX Performance Index EOD
-STOOQ_URL: str = "https://stooq.com/q/d/l/?s=%5Edax&i=d"
-STOOQ_SOURCE_LABEL: str = "stooq.com CSV (https://stooq.com/q/d/l/?s=^dax&i=d)"
-
-# Quelle 2: Yahoo Finance v8 Chart-API — keyless JSON, Symbol ^GDAXI
+# Quelle 1: Yahoo Finance v8 Chart-API — keyless JSON, Symbol ^GDAXI (Xetra)
+# period1 = 1136073600 = 2006-01-01T00:00:00Z (Spec-Startbereich);
+# period2 = 9999999999 = weit in der Zukunft ("bis heute").
+# Hinweis: `range=max` liefert bei ^GDAXI nur ~3 Monate (empirisch 2026-07-10),
+# daher explizite period1/period2-Epochen.
 YAHOO_URL: str = (
     "https://query1.finance.yahoo.com/v8/finance/chart/%5EGDAXI"
-    "?range=max&interval=1d&events=history"
+    "?period1=1136073600&period2=9999999999&interval=1d"
 )
-YAHOO_SOURCE_LABEL: str = "Yahoo Finance v8 chart JSON (^GDAXI, range=max, interval=1d)"
+YAHOO_SOURCE_LABEL: str = (
+    "Yahoo Finance v8 chart JSON (^GDAXI, period1=2006-01-01, interval=1d)"
+)
 
-# Yahoo blockt Requests ohne Browser-artigen User-Agent (HTTP 429/403)
+# Quelle 2: Onvista EOD-History — keyless JSON, DAX INDEX 20735, Xetra-Notation 20735
+# Historie verfuegbar ab 1987-12-30 (Feld datetimeStartAvailableHistory, geprueft 2026-07-10)
+ONVISTA_EOD_URL_TEMPLATE: str = (
+    "https://api.onvista.de/api/v1/instruments/INDEX/20735/eod_history"
+    "?idNotation=20735&range=Y1&startDate={start_date}"
+)
+ONVISTA_SOURCE_LABEL: str = (
+    "Onvista EOD-history JSON (DAX INDEX 20735, Xetra, Jahres-Slices range=Y1)"
+)
+
+# Yahoo/Onvista blocken Requests ohne Browser-artigen User-Agent
 HTTP_USER_AGENT: str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) kpm-backtest/1.0"
 
 # Spec AP-K2: Datenbereich 2006-heute
@@ -96,8 +114,8 @@ FETCH_TIMEOUT_S: float = 30.0
 
 # Default-Cache-Verzeichnis (committed im kmo-Repo)
 DATA_DIR: Path = Path(__file__).resolve().parent / "data"
-CACHE_PRIMARY: str = "dax_stooq.csv"
-CACHE_SECONDARY: str = "dax_yahoo.csv"
+CACHE_PRIMARY: str = "dax_yahoo.csv"
+CACHE_SECONDARY: str = "dax_onvista.csv"
 REPORT_FILENAME: str = "CROSS-VALIDATION-REPORT.md"
 
 
@@ -136,32 +154,6 @@ class CrossValidationReport:
 # Parsing (rein, offline-testbar)
 # ---------------------------------------------------------------------------
 
-def parse_stooq_csv(text: str, min_start: date = MIN_START_DATE) -> List[PriceBar]:
-    """Parst stooq-CSV (Date,Open,High,Low,Close,Volume) zu PriceBars ab min_start.
-
-    Zeilen mit fehlenden/unparsbaren OHLC-Feldern werden uebersprungen (geloggt).
-    """
-    rows: List[PriceBar] = []
-    reader = csv.DictReader(io.StringIO(text))
-    for rec in reader:
-        try:
-            d = datetime.strptime(rec["Date"].strip(), "%Y-%m-%d").date()
-            bar = (
-                d,
-                float(rec["Open"]),
-                float(rec["High"]),
-                float(rec["Low"]),
-                float(rec["Close"]),
-            )
-        except (KeyError, TypeError, ValueError):
-            logger.debug("stooq: unparsbare Zeile uebersprungen: %r", rec)
-            continue
-        if d >= min_start:
-            rows.append(bar)
-    rows.sort(key=lambda b: b[0])
-    return rows
-
-
 def parse_yahoo_json(text: str, min_start: date = MIN_START_DATE) -> List[PriceBar]:
     """Parst Yahoo-v8-Chart-JSON zu PriceBars ab min_start.
 
@@ -189,6 +181,36 @@ def parse_yahoo_json(text: str, min_start: date = MIN_START_DATE) -> List[PriceB
     return sorted(dedup.values(), key=lambda b: b[0])
 
 
+def parse_onvista_json(text: str, min_start: date = MIN_START_DATE) -> List[PriceBar]:
+    """Parst Onvista-eod_history-JSON (ein Jahres-Slice) zu PriceBars ab min_start.
+
+    Feld-Mapping: datetimeLast (UTC-Epochen), first=Open, high, low, last=Close.
+    Eintraege mit null-Werten werden uebersprungen.
+    """
+    payload = json.loads(text)
+    timestamps = payload.get("datetimeLast") or []
+    opens = payload.get("first") or []
+    highs = payload.get("high") or []
+    lows = payload.get("low") or []
+    closes = payload.get("last") or []
+    if timestamps and not (opens and highs and lows and closes):
+        raise ValueError("Onvista-JSON ohne erwartete OHLC-Felder (first/high/low/last)")
+
+    rows: List[PriceBar] = []
+    for i, ts in enumerate(timestamps):
+        try:
+            o, h, lo, c = opens[i], highs[i], lows[i], closes[i]
+        except IndexError:
+            break
+        if None in (o, h, lo, c):
+            continue
+        d = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+        if d >= min_start:
+            rows.append((d, float(o), float(h), float(lo), float(c)))
+    dedup: Dict[date, PriceBar] = {b[0]: b for b in rows}
+    return sorted(dedup.values(), key=lambda b: b[0])
+
+
 # ---------------------------------------------------------------------------
 # Fetch (nur via refresh_cache / CLI; in Tests IMMER gemockt)
 # ---------------------------------------------------------------------------
@@ -199,14 +221,26 @@ def _http_get(url: str, timeout_s: float = FETCH_TIMEOUT_S) -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
-def fetch_stooq(http_get: Callable[[str], str] = _http_get) -> List[PriceBar]:
-    """Live-Abruf Quelle 1 (stooq). `http_get` injizierbar fuer Tests."""
-    return parse_stooq_csv(http_get(STOOQ_URL))
-
-
 def fetch_yahoo(http_get: Callable[[str], str] = _http_get) -> List[PriceBar]:
-    """Live-Abruf Quelle 2 (Yahoo v8 chart). `http_get` injizierbar fuer Tests."""
+    """Live-Abruf Quelle 1 (Yahoo v8 chart, range=max). `http_get` injizierbar."""
     return parse_yahoo_json(http_get(YAHOO_URL))
+
+
+def fetch_onvista(http_get: Callable[[str], str] = _http_get,
+                  start_year: int = MIN_START_DATE.year,
+                  end_year: Optional[int] = None) -> List[PriceBar]:
+    """Live-Abruf Quelle 2 (Onvista) in Jahres-Slices (range=Y1 pro startDate).
+
+    Merge ueber Datums-Dedup (letzter Slice gewinnt bei Ueberlapp).
+    """
+    end_year = end_year or date.today().year
+    merged: Dict[date, PriceBar] = {}
+    for year in range(start_year, end_year + 1):
+        url = ONVISTA_EOD_URL_TEMPLATE.format(start_date=f"{year}-01-01")
+        rows = parse_onvista_json(http_get(url))
+        for bar in rows:
+            merged[bar[0]] = bar
+    return sorted(merged.values(), key=lambda b: b[0])
 
 
 # ---------------------------------------------------------------------------
@@ -244,9 +278,8 @@ def quality_check(rows: List[PriceBar]) -> QualityReport:
                 gaps.append((prev[0], d, missing))
         prev = bar
     for g in gaps:
-        logger.warning("Daten-Luecke geflaggt: %s -> %s (~%d Handelstage fehlen)", *[
-            g[0].isoformat(), g[1].isoformat(), g[2]
-        ])
+        logger.warning("Daten-Luecke geflaggt: %s -> %s (~%d Handelstage fehlen)",
+                       g[0].isoformat(), g[1].isoformat(), g[2])
     return QualityReport(
         n_rows=len(rows),
         first_date=rows[0][0] if rows else None,
@@ -365,23 +398,23 @@ def refresh_cache(data_dir: Path = DATA_DIR,
     trotzdem gecacht und der Report dokumentiert den Ausfall explizit.
     """
     retrieved = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
-    primary = fetch_stooq(http_get)
+    primary = fetch_yahoo(http_get)
     q1 = quality_check(primary)
     if q1.n_rows < MIN_TRADING_DAYS:
         raise ValueError(
             f"Quelle 1 liefert nur {q1.n_rows} Handelstage (< {MIN_TRADING_DAYS})"
         )
-    write_cache(primary, data_dir / CACHE_PRIMARY, STOOQ_SOURCE_LABEL, retrieved)
+    write_cache(primary, data_dir / CACHE_PRIMARY, YAHOO_SOURCE_LABEL, retrieved)
 
     secondary: List[PriceBar] = []
     secondary_error: Optional[str] = None
     try:
-        secondary = fetch_yahoo(http_get)
+        secondary = fetch_onvista(http_get)
         quality_check(secondary)
-        write_cache(secondary, data_dir / CACHE_SECONDARY, YAHOO_SOURCE_LABEL, retrieved)
+        write_cache(secondary, data_dir / CACHE_SECONDARY, ONVISTA_SOURCE_LABEL, retrieved)
     except Exception as exc:  # ehrlicher Ausfall-Report statt Silent-Fail
         secondary_error = f"{type(exc).__name__}: {exc}"
-        logger.error("Quelle 2 (Yahoo) nicht verfuegbar: %s", secondary_error)
+        logger.error("Quelle 2 (Onvista) nicht verfuegbar: %s", secondary_error)
 
     report = cross_validate(primary, secondary)
     _write_report_md(data_dir, report, q1,
@@ -397,16 +430,21 @@ def _write_report_md(data_dir: Path, cv: CrossValidationReport, q1: QualityRepor
         "# Kreuzvalidierungs-Report DAX-EOD [CRUX-MK]",
         "",
         f"- Abrufdatum (UTC): {retrieved}",
-        f"- Quelle 1 (primaer): {STOOQ_SOURCE_LABEL}",
+        "- Hinweis Quellen-Wahl: stooq.com (Spec-Vorschlag) war zum Abrufzeitpunkt",
+        "  durch eine JavaScript-Proof-of-Work-Bot-Challenge gated und wurde NICHT",
+        "  umgangen. Ersatz-Quellen: Yahoo (primaer) + Onvista (sekundaer).",
+        f"- Quelle 1 (primaer): {YAHOO_SOURCE_LABEL}",
         f"  - Handelstage: {q1.n_rows} ({q1.first_date} bis {q1.last_date})",
-        f"  - Luecken > {GAP_FLAG_TRADING_DAYS} Handelstage: {len(q1.gaps)}",
+        f"  - Luecken > {GAP_FLAG_TRADING_DAYS} Handelstage: {len(q1.gaps)}"
+        + (f" {[(a.isoformat(), b.isoformat(), n) for a, b, n in q1.gaps]}" if q1.gaps else ""),
         f"  - SHA256: {_sha256_of(data_dir / CACHE_PRIMARY)}",
     ]
     if q2 is not None:
         lines += [
-            f"- Quelle 2 (sekundaer): {YAHOO_SOURCE_LABEL}",
+            f"- Quelle 2 (sekundaer): {ONVISTA_SOURCE_LABEL}",
             f"  - Handelstage: {q2.n_rows} ({q2.first_date} bis {q2.last_date})",
-            f"  - Luecken > {GAP_FLAG_TRADING_DAYS} Handelstage: {len(q2.gaps)}",
+            f"  - Luecken > {GAP_FLAG_TRADING_DAYS} Handelstage: {len(q2.gaps)}"
+            + (f" {[(a.isoformat(), b.isoformat(), n) for a, b, n in q2.gaps]}" if q2.gaps else ""),
             f"  - SHA256: {_sha256_of(data_dir / CACHE_SECONDARY)}",
             "",
             "## Kreuzvalidierung (Ueberlapp-Datumsbereich, Close-to-Close)",
