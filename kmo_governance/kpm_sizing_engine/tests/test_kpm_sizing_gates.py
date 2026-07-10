@@ -40,9 +40,12 @@ def _diverse_gate() -> HIVEGovernanceGate:
 class TestHIVEGovernanceGate:
     def test_uniform_distribution_max_entropy(self) -> None:
         # 3 pos, 3 neg, 3 neu -> Gleichverteilung -> H = log2(3), HIVE = 1.0
-        gate = _diverse_gate()
+        gate = HIVEGovernanceGate([[1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, -1.0, 0.0]])
         assert abs(gate.shannon_entropy() - math.log2(3)) < TOL
         assert abs(gate.normalized_hive() - 1.0) < TOL
+        # _diverse_gate: 4 pos / 3 neg / 2 neu -> H explizit
+        expected = -sum((c / 9) * math.log2(c / 9) for c in (4, 3, 2))
+        assert abs(_diverse_gate().shannon_entropy() - expected) < TOL
 
     def test_concentration_zero_entropy(self) -> None:
         gate = HIVEGovernanceGate([[1.0, 1.0], [1.0, 1.0]])
@@ -146,7 +149,8 @@ class TestRegimeBreakDetector:
         res = det.edge_decay_alert(realized, forecast)
         assert res.consecutive_months == 3
         assert res.decay is True
-        assert abs(res.mean_delta - ((0.01 - 0.015 - 0.019) + 0.01) / 4) < 1e-12
+        deltas = [0.02 - 0.01, 0.01 - 0.02, 0.005 - 0.02, 0.001 - 0.02]
+        assert abs(res.mean_delta - sum(deltas) / 4) < 1e-12
 
     def test_combined_regime_status(self) -> None:
         det = RegimeBreakDetector(_regime_series())
