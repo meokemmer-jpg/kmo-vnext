@@ -1,20 +1,20 @@
 # Kreuzvalidierungs-Report DAX-EOD [CRUX-MK]
 
-- Abrufdatum (UTC): 2026-07-27T16:10:02+00:00
+- Abrufdatum (UTC): 2026-07-28T16:10:03+00:00
 - Hinweis Quellen-Wahl: stooq.com (Spec-Vorschlag) war zum Abrufzeitpunkt
   durch eine JavaScript-Proof-of-Work-Bot-Challenge gated und wurde NICHT
   umgangen. Ersatz-Quellen: Yahoo (primaer) + Onvista (sekundaer).
 - Quelle 1 (primaer): Yahoo Finance v8 chart JSON (^GDAXI, period1=2006-01-01, interval=1d)
-  - Handelstage: 5217 (2006-01-02 bis 2026-07-27)
+  - Handelstage: 5218 (2006-01-02 bis 2026-07-28)
   - Luecken > 5 Handelstage: 0
-  - SHA256: 9144298011104bcd3a190b8e17cc5e9b4e241698fd2d036a84471e89e6f6a4ca
+  - SHA256: 5fce6aeec06b56b21e9085a6610b8ca8358194810eab76ed785d020e3887a979
 - Quelle 2 (sekundaer): Onvista EOD-history JSON (DAX INDEX 20735, Xetra, Jahres-Slices range=Y1)
-  - Handelstage: 5220 (2006-01-02 bis 2026-07-27)
+  - Handelstage: 5221 (2006-01-02 bis 2026-07-28)
   - Luecken > 5 Handelstage: 0
-  - SHA256: 6feb2cd31ec1f141c435b93c9e58a45bd5af181036b0625ac841211a62981d26
+  - SHA256: 03cd612916a4e6994bec65b9704f315dc2ffe68250e69e37a9c839124a86804b
 
 ## Kreuzvalidierung (Ueberlapp-Datumsbereich, Close-to-Close)
-- Ueberlapp: 5216 Handelstage (2006-01-02 bis 2026-07-27)
+- Ueberlapp: 5217 Handelstage (2006-01-02 bis 2026-07-28)
 - Mittlere abs. Abweichung: 0.0001 % (Toleranz < 0.5 %)
 - Max. abs. Abweichung: 0.2199 %
 - Verdict: PASS
