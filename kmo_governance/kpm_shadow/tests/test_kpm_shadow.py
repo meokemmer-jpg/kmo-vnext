@@ -118,6 +118,11 @@ ERLAUBTE_IMPORTS = {
     "__future__", "argparse", "ast", "json", "logging", "os", "re",
     "subprocess", "sys", "datetime", "pathlib", "typing", "dataclasses",
     "kmo_governance", "pytest",
+    # importlib: NUR fuer das Laden des Upstream-Pruefers per Pfad (kpm[0]).
+    # Ein Blanket-Freibrief waere hier eine echte Schwaechung — importlib kann alles
+    # laden. Deshalb gilt die Erlaubnis zusammen mit
+    # test_importlib_laedt_ausschliesslich_den_upstream_pruefer, das das Ziel pinnt.
+    "importlib",
 }
 
 BROKER_TOKENS = re.compile(
@@ -153,6 +158,45 @@ def test_no_broker_imports_ast_allowlist():
                 assert top in ERLAUBTE_IMPORTS, (
                     f"K_0-VERSTOSS: nicht-erlaubter Import '{top}' in {path.name}"
                 )
+
+
+def test_importlib_laedt_ausschliesslich_den_upstream_pruefer():
+    """Der importlib-Freibrief ist gepinnt, nicht offen.
+
+    importlib kann jedes Modul laden — auch eine Broker-Bibliothek. Die Erlaubnis in
+    ERLAUBTE_IMPORTS waere ohne diese Gegenprobe ein Loch in der K_0-Wand. Geprueft
+    wird: es gibt genau einen spec_from_file_location-Aufruf, und sein Ziel ist die
+    Pfad-Konstante des Pruefers, kein berechneter oder uebergebener Pfad.
+    """
+    quelle = (MODULE_DIR / "shadow_mode_daemon.py").read_text(encoding="utf-8")
+    tree = ast.parse(quelle)
+    aufrufe = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", None) == "spec_from_file_location"
+    ]
+    assert len(aufrufe) == 1, f"{len(aufrufe)} importlib-Ladestellen — erwartet genau 1"
+    ziel = aufrufe[0].args[1]
+    assert isinstance(ziel, ast.Name) and ziel.id == "_VERIFY_PFAD", (
+        "importlib laedt einen nicht-gepinnten Pfad"
+    )
+    assert smd._VERIFY_PFAD.name == "kpm_ledger_verify.py"
+
+
+def test_negativ_importlib_pin_wuerde_ein_fremdes_ziel_fangen():
+    """Trennschaerfe des Pins: mit berechnetem Pfad muss die Pruefung scheitern."""
+    tree = ast.parse(
+        "import importlib.util\n"
+        "def f(p):\n"
+        "    return importlib.util.spec_from_file_location('x', p)\n"
+    )
+    aufrufe = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", None) == "spec_from_file_location"
+    ]
+    ziel = aufrufe[0].args[1]
+    assert not (isinstance(ziel, ast.Name) and ziel.id == "_VERIFY_PFAD")
 
 
 def test_no_broker_grep_und_keine_order_api_calls():
@@ -281,3 +325,77 @@ def test_replay_komplette_backtest_historie_null_fehlrate():
         assert rep.max_exposure <= 0.40 + 1e-9
         assert rep.min_cash_quote_pct >= 60.0 - 1e-6
         assert rep.breaches == 0  # regelkonforme Variante-D: kein Breach moeglich
+
+
+# ==========================================================================
+# kpm[0]: Benchmark-Spalte + Upstream-Verifikation (Auftrag 2026-09-07)
+# ==========================================================================
+
+def test_ledger_entry_traegt_benchmark_spalte():
+    """Ohne Vergleichswert sieht jede Reihe gut aus — deshalb Pflichtfeld."""
+    bars = load_dax()
+    entry = smd.build_ledger_entry(bars)
+    assert "benchmark_6040_equity_eur" in entry
+    assert entry["benchmark_6040_equity_eur"] > 0
+    assert "unverzinst" in entry["benchmark_note"], "Vereinfachung muss deklariert sein"
+
+
+def test_benchmark_ist_engine_frei_gerechnet():
+    """Der Benchmark darf nicht aus der Engine kommen, sonst vergleicht sie sich
+    mit sich selbst. Gegenprobe: aus denselben Kursen von Hand nachgerechnet."""
+    bars = load_dax()[-50:]
+    v = smd.lade_verifier()
+    assert v is not None
+    closes = [b[smd.CLOSE_INDEX] for b in bars]
+    erwartet = 100_000.0
+    for vor, nach in zip(closes, closes[1:]):
+        erwartet *= 1 + 0.60 * (nach / vor - 1)
+    b = v.benchmark_6040(closes, 100_000.0)
+    assert b["benchmark_6040_equity_eur"] == pytest.approx(round(erwartet, 2), abs=0.01)
+
+
+def test_upstream_pruefer_ist_ladbar_und_engine_frei():
+    v = smd.lade_verifier()
+    assert v is not None, "Pruefer nicht ladbar — Ledger prueft sich wieder selbst"
+    sauber, befunde = v.verify_no_engine_dependency()
+    assert sauber, f"Pruefer haengt am Erzeuger: {befunde}"
+
+
+def test_ledger_verdikt_auf_sauberem_ledger_ist_holds(tmp_path):
+    led = tmp_path / "l.jsonl"
+    bars = load_dax()
+    smd.append_entry(smd.build_ledger_entry(bars), ledger_path=led)
+    verdikt, n_hollow = smd.ledger_verdikt(led)
+    assert verdikt == "HOLDS"
+    assert n_hollow == 0
+
+
+def test_ledger_verdikt_faengt_einen_gecrafteten_verstoss(tmp_path):
+    """Trennschaerfe auf Daemon-Ebene: das Verdikt darf nicht immer HOLDS sein."""
+    led = tmp_path / "l.jsonl"
+    entry = smd.build_ledger_entry(load_dax())
+    entry["mode"] = "LIVE"          # K_0-Verletzung
+    smd.append_entry(entry, ledger_path=led)
+    verdikt, n_hollow = smd.ledger_verdikt(led)
+    assert verdikt == "HOLLOW"
+    assert n_hollow >= 1
+
+
+def test_pruefer_ausfall_liefert_fragezeichen_nicht_holds(tmp_path, monkeypatch):
+    """Lose-Coupling (LC1/LC2): ein toter Pruefer stoppt den Lauf nicht — er darf
+    aber auch kein gruenes Urteil vortaeuschen."""
+    monkeypatch.setattr(smd, "lade_verifier", lambda: None)
+    verdikt, n_hollow = smd.ledger_verdikt(tmp_path / "egal.jsonl")
+    assert verdikt == "?"
+    assert n_hollow == 0
+
+
+def test_main_gibt_verdikt_und_benchmark_aus(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(smd, "LOCK_ROOT", tmp_path)
+    monkeypatch.setattr(smd, "other_instances_running", lambda *a, **k: False)
+    led = tmp_path / "l.jsonl"
+    assert smd.main(["--no-refresh", "--ledger", str(led)]) == 0
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["ledger_verify"] in ("HOLDS", "HOLLOW", "?")
+    assert out["benchmark_6040_equity_eur"] is not None
+    assert out["mode"] == "PAPER"

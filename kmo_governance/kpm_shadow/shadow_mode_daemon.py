@@ -17,6 +17,25 @@ Ablauf (1x taeglich, werktags 18:10 via LaunchAgent com.kemmer.kpm-shadow):
   4. Append-only-Ledger `kpm_shadow/ledger.jsonl` (1 Entry pro Handelstag,
      idempotent: existiert der Tag schon, wird NICHT dupliziert).
   5. Cash-Quote-Monitor (AP-K5) prueft den neuen Eintrag sofort.
+  6. Upstream-Verifikation des gesamten Ledgers durch einen Pruefer, der die
+     Engine NICHT aufruft (`_df_common/kpm_ledger_verify.py`).
+
+BENCHMARK-SPALTE (Auftrag kpm[0], 2026-09-07)
+---------------------------------------------
+Jeder Eintrag traegt seit heute einen unabhaengig gerechneten 60/40-Vergleichswert.
+Ohne ihn sieht jede Reihe gut aus: eine Equity-Kurve, die nur gegen sich selbst
+gezeigt wird, kann nicht schlecht aussehen. Der Benchmark kommt bewusst NICHT aus
+der Engine, sondern aus reinen Kursen (60 % Index, 40 % unverzinste Kassa) — er
+kennt weder Kelly noch Caps noch Regime und ist daher als Maszstab brauchbar.
+
+UNABHAENGIGER PRUEFER (Auftrag kpm[0])
+--------------------------------------
+Das Ledger prueft sich nicht mehr selbst. `kpm_ledger_verify` bewertet die Eintraege
+gegen Arithmetik-Identitaeten, gegen ~/.claude/rules/kpm-sizing.md und gegen
+Ketten-Eigenschaften — und beweist per AST, dass es die Engine nicht importiert.
+Muster geborgt von codex_verify / NUMBERS_AUDIT ("Pruefer-Familie != Loeser"), nicht
+neu erfunden. Faellt der Pruefer aus, laeuft der Daemon weiter und schreibt
+`ledger_verify: "?"` — Lose-Coupling per rules/df-lose-coupling.md LC1/LC2.
 
 LEDGER-HEADER (Zeile 1): dokumentiert den Start der 3-Monats-Shadow-Uhr
 per ~/.claude/rules/kpm-sizing.md Phase-1 (Shadow-Mode 3+ Monate Paper
@@ -58,10 +77,42 @@ __all__ = [
     "build_ledger_entry",
     "append_entry",
     "read_ledger",
+    "lade_verifier",
+    "ledger_verdikt",
     "main",
 ]
 
 logger = logging.getLogger(__name__)
+
+
+# --- Upstream-Pruefer laden (Lose-Coupling: Ausfall ist non-fatal) ---------------
+# Import per Pfad statt per sys.path: der Daemon laeuft mit WorkingDirectory kmo/,
+# _df_common liegt daneben. Ein sys.path-Eingriff waere ein globaler Nebeneffekt fuer
+# einen lokalen Bedarf.
+_VERIFY_PFAD = (
+    Path(__file__).resolve().parents[3] / "_df_common" / "kpm_ledger_verify.py"
+)
+
+
+def lade_verifier():
+    """Upstream-Pruefer laden. None = nicht verfuegbar (Daemon laeuft trotzdem)."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "kpm_ledger_verify", _VERIFY_PFAD)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Pflicht VOR exec_module: @dataclass schlaegt waehrend der Ausfuehrung
+        # sys.modules[cls.__module__] nach. Fehlt der Eintrag, stirbt der Import mit
+        # "'NoneType' object has no attribute '__dict__'" — ein Fehlerbild, das nichts
+        # ueber die eigentliche Ursache sagt.
+        sys.modules.setdefault(spec.name, mod)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as exc:  # noqa: BLE001 — Pruefer-Ausfall darf den Lauf nicht toeten
+        logger.warning("Upstream-Pruefer nicht ladbar (%s) — Eintrag ohne Verdikt", exc)
+        return None
 
 # --- Benannte Konstanten (keine Magic Numbers) --------------------------------
 
@@ -82,6 +133,9 @@ EXIT_K16_VETO: int = 3
 # pgrep-Muster fuer den Selbstcheck (Prozess-Ebene, zusaetzlich zum Lock)
 PGREP_PATTERN: str = "shadow_mode_daemon"
 PGREP_TIMEOUT_S: float = 5.0
+
+# PriceBar = (date, open, high, low, close) — Close ist Position 4.
+CLOSE_INDEX: int = 4
 
 
 class K16Locked(RuntimeError):
@@ -190,9 +244,23 @@ def build_ledger_entry(bars: Sequence[PriceBar], profile: str = SHADOW_PROFILE,
     Pre: len(bars) >= 2. Post: JSON-serialisierbares Dict mit den
     Pflicht-Feldern date/close/decision/exposure/dd_state/regime_flag/crux.
     """
-    result = run_backtest(bars, PROFILES[profile])
+    cfg = PROFILES[profile]
+    result = run_backtest(bars, cfg)
     rec = result.records[-1]
     decision = f"reject:{rec.reject_gate}" if rec.rejected else "accept"
+
+    # Benchmark: unabhaengig aus reinen Kursen, ohne Engine. Faellt der Pruefer aus,
+    # bleibt das Feld weg — und der Pruefer meldet spaeter L11 "kein Benchmark".
+    # Ein erfundener Platzhalter waere schlimmer als ein fehlendes Feld.
+    benchmark: Dict[str, object] = {}
+    verifier = lade_verifier()
+    if verifier is not None:
+        try:
+            closes = [b[CLOSE_INDEX] for b in bars]
+            benchmark = verifier.benchmark_6040(closes, cfg.initial_equity)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Benchmark nicht berechenbar (%s)", exc)
+
     return {
         "type": "entry",
         "date": rec.day.isoformat(),
@@ -208,6 +276,7 @@ def build_ledger_entry(bars: Sequence[PriceBar], profile: str = SHADOW_PROFILE,
         "trading_days_in_path": result.trading_days,
         "data_refresh": data_refresh,
         "mode": "PAPER",
+        **benchmark,
         "recorded_at": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
         "crux": "[CRUX-MK]",
     }
@@ -265,6 +334,25 @@ def append_entry(entry: Dict[str, object], ledger_path: Path = LEDGER_PATH) -> s
     return "appended"
 
 
+def ledger_verdikt(ledger_path: Path = LEDGER_PATH) -> tuple:
+    """Upstream-Urteil ueber das Ledger. ("?", 0) wenn der Pruefer fehlt.
+
+    Bewusst non-fatal: ein ausgefallener Pruefer darf den Shadow-Lauf nicht stoppen
+    (rules/df-lose-coupling.md LC1). Er darf aber auch kein HOLDS vortaeuschen —
+    deshalb "?" und nicht "HOLDS".
+    """
+    verifier = lade_verifier()
+    if verifier is None:
+        return ("?", 0)
+    try:
+        eintraege = verifier.lade_ledger(ledger_path)
+        urteil = verifier.pruefe_eintraege(eintraege)
+        return (urteil.verdikt, urteil.n_hollow)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ledger-Verifikation fehlgeschlagen (%s)", exc)
+        return ("?", 0)
+
+
 # --- CLI / Daemon-Einstieg -------------------------------------------------------
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -299,6 +387,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from kmo_governance.kpm_shadow.cash_quota_monitor import check_entry
         alarm = check_entry(entry)
 
+        # kpm[0]: Upstream-Urteil ueber das GESAMTE Ledger. Der Pruefer ruft die
+        # Engine nicht auf — deshalb ist sein HOLDS mehr wert als ein Selbst-OK.
+        verdikt, n_hollow = ledger_verdikt(args.ledger)
+
         print(json.dumps({
             "status": status,
             "date": entry["date"],
@@ -309,6 +401,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "dd_state": entry["dd_state"],
             "regime_flag": entry["regime_flag"],
             "cash_alarm": alarm is not None,
+            "benchmark_6040_equity_eur": entry.get("benchmark_6040_equity_eur"),
+            "ledger_verify": verdikt,
+            "ledger_verify_hollow": n_hollow,
             "mode": "PAPER",
             "crux": "[CRUX-MK]",
         }, ensure_ascii=False))
