@@ -74,7 +74,7 @@ __all__ = [
     "release_lock",
     "other_instances_running",
     "load_bars",
-    "build_ledger_entry",
+    "build_ledger_entry", "benchmark_anker", "letzter_pfad",
     "append_entry",
     "read_ledger",
     "lade_verifier",
@@ -129,12 +129,22 @@ SHADOW_PROFILE: str = "pilot-conservative"
 
 # Exit-Code bei K16-Veto (Konvention der existierenden DFs, z.B. cfl_engine)
 EXIT_K16_VETO: int = 3
+# Der Pfad ist kuerzer als beim letzten Eintrag: die Kurshistorie ist zwischen
+# zwei Laeufen geschrumpft. Am 2026-08-19 ist genau das passiert (5233 -> 5231,
+# also drei Bars zu wenig), und der Lauf hat auf dieser Basis die Exposure von
+# 0,0210 auf 0,0175 gesenkt und tags darauf auf 0. Das Feld data_refresh stand
+# an allen vier Anomalie-Tagen auf "refreshed": der Refresh berichtet ueber sich
+# selbst, niemand misst, was ankam. Kein Eintrag ist besser als ein Eintrag aus
+# nachweislich unvollstaendigen Daten — bleibt die Quelle kaputt, faengt L12
+# (Frische) den Stillstand nach vier Wochentagen.
+EXIT_PFAD_GESCHRUMPFT: int = 4
 
 # pgrep-Muster fuer den Selbstcheck (Prozess-Ebene, zusaetzlich zum Lock)
 PGREP_PATTERN: str = "shadow_mode_daemon"
 PGREP_TIMEOUT_S: float = 5.0
 
 # PriceBar = (date, open, high, low, close) — Close ist Position 4.
+DATE_INDEX: int = 0   # PriceBar = (date, open, high, low, close)
 CLOSE_INDEX: int = 4
 
 
@@ -234,8 +244,42 @@ def load_bars(refresh: bool = True, data_dir: Optional[Path] = None) -> List[Pri
     return load_dax(**kwargs)
 
 
+def benchmark_anker(ledger_path: Path = LEDGER_PATH) -> Optional[tuple]:
+    """(Startdatum, Startequity) des Shadow-Fensters aus dem ersten Eintrag.
+
+    Warum ueberhaupt: der Benchmark lief bisher ueber den GANZEN Kurspfad
+    (5247 Bars) und haette morgen 284.862,50 EUR / +184,86 % neben eine
+    Shadow-Equity von 102.996 EUR geschrieben — ein 20-Jahres-Benchmark gegen
+    ein 2-Monats-Ergebnis, im Ledger, das die Demo ausliest. Beide Seiten
+    muessen dasselbe Fenster und denselben Startpunkt haben; der Startpunkt ist
+    die tatsaechliche erste Equity, nicht die nominellen 100.000 (sonst werden
+    der Engine 2.906 EUR aus der Zeit VOR Ledger-Beginn gutgeschrieben).
+
+    None = Ledger leer, dann ist der heutige Eintrag der Anker.
+    """
+    entries = [r for r in read_ledger(ledger_path) if r.get("type") == "entry"]
+    if not entries:
+        return None
+    erster = min(entries, key=lambda r: str(r.get("date", "")))
+    try:
+        return str(erster["date"]), float(erster["equity_paper_eur"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def letzter_pfad(ledger_path: Path = LEDGER_PATH) -> Optional[int]:
+    """trading_days_in_path des juengsten Eintrags. None = kein Vergleichswert."""
+    entries = [r for r in read_ledger(ledger_path) if r.get("type") == "entry"]
+    if not entries:
+        return None
+    juengster = max(entries, key=lambda r: str(r.get("date", "")))
+    wert = juengster.get("trading_days_in_path")
+    return wert if isinstance(wert, int) else None
+
+
 def build_ledger_entry(bars: Sequence[PriceBar], profile: str = SHADOW_PROFILE,
-                       data_refresh: str = "refreshed") -> Dict[str, object]:
+                       data_refresh: str = "refreshed",
+                       anker: Optional[tuple] = None) -> Dict[str, object]:
     """Variante-D-Entscheidung fuer den NEUESTEN Close als Ledger-Entry.
 
     Deterministisch: kompletter Backtest-Pfad (run_backtest), letzter
@@ -256,8 +300,20 @@ def build_ledger_entry(bars: Sequence[PriceBar], profile: str = SHADOW_PROFILE,
     verifier = lade_verifier()
     if verifier is not None:
         try:
-            closes = [b[CLOSE_INDEX] for b in bars]
-            benchmark = verifier.benchmark_6040(closes, cfg.initial_equity)
+            if anker is None:
+                # Erster Eintrag: der Benchmark startet hier, also 0 % — das ist
+                # ehrlich und wird ab morgen zur Vergleichsbasis.
+                fenster, start_equity = [rec.close], rec.equity
+            else:
+                ab_datum, start_equity = anker
+                fenster = [b[CLOSE_INDEX] for b in bars
+                           if b[DATE_INDEX].isoformat() >= ab_datum]
+            if len(fenster) >= 1 and start_equity > 0:
+                benchmark = verifier.benchmark_6040(fenster, start_equity)
+                benchmark["benchmark_fenster_ab"] = anker[0] if anker else rec.day.isoformat()
+                benchmark["benchmark_fenster_bars"] = len(fenster)
+            else:
+                logger.warning("Benchmark-Fenster leer — Feld bleibt weg")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Benchmark nicht berechenbar (%s)", exc)
 
@@ -380,7 +436,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         entry = build_ledger_entry(
             bars, profile=args.profile,
             data_refresh="refreshed" if refresh else "offline-cache",
+            anker=benchmark_anker(args.ledger),
         )
+
+        # Schrumpf-Wall: gegen den letzten Eintrag, nicht gegen die eigene Meldung.
+        vorher = letzter_pfad(args.ledger)
+        jetzt = entry.get("trading_days_in_path")
+        if (vorher is not None and isinstance(jetzt, int) and jetzt < vorher
+                and os.environ.get("KPM_SHADOW_ERLAUBE_PFAD_SCHRUMPF") != "true"):
+            logger.error(
+                "Kurshistorie geschrumpft: %s -> %s Bars. Kein Eintrag geschrieben — "
+                "eine Entscheidung aus nachweislich unvollstaendigen Daten waere "
+                "schlimmer als eine Luecke. Bleibt die Quelle kurz, meldet L12 "
+                "(Frische) den Stillstand nach vier Wochentagen. Override nur "
+                "bewusst: KPM_SHADOW_ERLAUBE_PFAD_SCHRUMPF=true [CRUX-MK]",
+                vorher, jetzt)
+            return EXIT_PFAD_GESCHRUMPFT
+
         status = append_entry(entry, ledger_path=args.ledger)
 
         # AP-K5: Cash-Quote-Invariante pro neuem Eintrag pruefen

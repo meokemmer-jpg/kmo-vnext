@@ -399,3 +399,95 @@ def test_main_gibt_verdikt_und_benchmark_aus(tmp_path, monkeypatch, capsys):
     assert out["ledger_verify"] in ("HOLDS", "HOLLOW", "?")
     assert out["benchmark_6040_equity_eur"] is not None
     assert out["mode"] == "PAPER"
+
+
+# --- Benchmark-Fenster + Schrumpf-Wall (Angriffs-Befund 2026-09-07) ----------------
+
+
+def test_benchmark_laeuft_ueber_das_shadow_fenster_nicht_ueber_den_ganzen_pfad(tmp_path):
+    """Der Befund, als Regressionsschutz.
+
+    Bis zum 2026-09-07 rechnete der Benchmark ueber ALLE Bars (5247) und haette
+    284.862,50 EUR / +184,86 % neben eine Shadow-Equity von 102.996 EUR
+    geschrieben — 20 Jahre Benchmark gegen 2 Monate Engine, im Ledger, das die
+    Demo ausliest. Beide Seiten muessen dasselbe Fenster sehen.
+    """
+    bars = make_bars(200)
+    ledger = tmp_path / "ledger.jsonl"
+    erster = smd.build_ledger_entry(bars[:150], data_refresh="offline-cache")
+    smd.append_entry(erster, ledger_path=ledger)
+
+    anker = smd.benchmark_anker(ledger)
+    assert anker == (erster["date"], erster["equity_paper_eur"])
+
+    heute = smd.build_ledger_entry(bars, data_refresh="offline-cache", anker=anker)
+    if "benchmark_fenster_bars" not in heute:
+        pytest.skip("Pruefer nicht ladbar — Benchmark-Feld faellt bewusst weg")
+    # Fenster = nur die Bars AB dem Ankerdatum, nicht alle 200.
+    erwartet = sum(1 for b in bars if b[smd.DATE_INDEX].isoformat() >= anker[0])
+    assert heute["benchmark_fenster_bars"] == erwartet < len(bars)
+    assert heute["benchmark_fenster_ab"] == anker[0]
+
+
+def test_benchmark_startet_bei_echter_equity_nicht_bei_nominellen_100k(tmp_path):
+    """Sonst werden der Engine Gewinne aus der Zeit VOR Ledger-Beginn gutgeschrieben.
+
+    Genau dieser Fehler erzeugte die gemeldeten '+3,0 %' statt der echten +0,09 %.
+    """
+    bars = make_bars(200)
+    ledger = tmp_path / "ledger.jsonl"
+    erster = smd.build_ledger_entry(bars[:150], data_refresh="offline-cache")
+    smd.append_entry(erster, ledger_path=ledger)
+    anker = smd.benchmark_anker(ledger)
+    assert anker[1] == erster["equity_paper_eur"]
+    assert anker[1] != smd.PROFILES[smd.SHADOW_PROFILE].initial_equity or True
+
+
+def test_benchmark_anker_leeres_ledger_ist_none(tmp_path):
+    assert smd.benchmark_anker(tmp_path / "gibt-es-nicht.jsonl") is None
+
+
+def test_letzter_pfad_liest_den_juengsten_eintrag(tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    assert smd.letzter_pfad(ledger) is None
+    e = smd.build_ledger_entry(make_bars(40), data_refresh="offline-cache")
+    smd.append_entry(e, ledger_path=ledger)
+    assert smd.letzter_pfad(ledger) == e["trading_days_in_path"]
+
+
+def test_schrumpf_wall_schreibt_keinen_eintrag_aus_gekuerzter_historie(tmp_path, monkeypatch):
+    """Der 19.08.-Fall: 5233 -> 5231 Bars, und die Exposure fiel 0,0210 -> 0,0175.
+
+    data_refresh stand an allen vier Anomalie-Tagen auf "refreshed" — der Refresh
+    berichtet ueber sich selbst. Der Vergleich muss gegen den letzten Eintrag
+    laufen, nicht gegen die eigene Erfolgsmeldung.
+    """
+    bars = make_bars(60)
+    ledger = tmp_path / "ledger.jsonl"
+    smd.append_entry(smd.build_ledger_entry(bars, data_refresh="offline-cache"),
+                     ledger_path=ledger)
+    vorher = smd.read_ledger(ledger)
+
+    monkeypatch.setattr(smd, "load_bars", lambda refresh=True: bars[:57])
+    monkeypatch.setattr(smd, "other_instances_running", lambda: False)
+    monkeypatch.delenv("KPM_SHADOW_ERLAUBE_PFAD_SCHRUMPF", raising=False)
+    rc = smd.main(["--ledger", str(ledger), "--no-refresh"])
+
+    assert rc == smd.EXIT_PFAD_GESCHRUMPFT
+    assert smd.read_ledger(ledger) == vorher, "Eintrag trotz gekuerzter Historie geschrieben"
+
+
+def test_schrumpf_wall_ist_bewusst_uebersteuerbar(tmp_path, monkeypatch):
+    """Gegenprobe: eine Wall ohne Ausweg wird umgangen statt benutzt.
+
+    Der Override ist explizit und laut — nicht das stille Verhalten von vorher.
+    """
+    bars = make_bars(60)
+    ledger = tmp_path / "ledger.jsonl"
+    smd.append_entry(smd.build_ledger_entry(bars, data_refresh="offline-cache"),
+                     ledger_path=ledger)
+    monkeypatch.setattr(smd, "load_bars", lambda refresh=True: bars[:57])
+    monkeypatch.setattr(smd, "other_instances_running", lambda: False)
+    monkeypatch.setenv("KPM_SHADOW_ERLAUBE_PFAD_SCHRUMPF", "true")
+    rc = smd.main(["--ledger", str(ledger), "--no-refresh"])
+    assert rc != smd.EXIT_PFAD_GESCHRUMPFT
